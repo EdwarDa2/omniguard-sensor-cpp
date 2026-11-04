@@ -81,6 +81,10 @@ docker exec -it redis-temp redis-cli SUBSCRIBE network_events
 **3. Ejecutar el sensor** (requiere `sudo` para capturar paquetes)
 
 ```bash
+#Para entrar en windows :
+wsl -d Ubuntu
+cd ~/omniguard-soc/omniguard-sensor-cpp
+
 sudo ./build/omniguard-sensor
 ```
 
