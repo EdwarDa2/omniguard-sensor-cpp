@@ -1,0 +1,46 @@
+# --- Compilación (CMake) ---
+build/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+compile_commands.json
+
+# --- Objetos y binarios ---
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.out
+omniguard-sensor
+
+# --- Depuración ---
+core
+core.*
+*.dSYM/
+*.log
+
+# --- Capturas de red (pueden contener datos sensibles) ---
+*.pcap
+*.pcapng
+*.cap
+
+# --- Secretos y configuración local ---
+.env
+.env.*
+!.env.example
+
+# --- IDEs y herramientas ---
+.vscode/
+.idea/
+.cache/
+*.swp
+*~
+
+# --- Sistema operativo ---
+.DS_Store
+Thumbs.db
+desktop.ini
