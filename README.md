@@ -1,42 +1,90 @@
 # omniguard-sensor-cpp
 
-Sensor de red del proyecto **OmniGuard SOC** (plataforma de ciberseguridad Blue Team). Captura tráfico IPv4 de una interfaz de red con **libpcap**, extrae los datos clave de cada paquete y los publica como JSON en un canal **Redis Pub/Sub** para que otros servicios los analicen.
+Sensor de red del proyecto **OmniGuard SOC** (plataforma de ciberseguridad Blue Team). Captura tráfico IPv4 con **libpcap**, **identifica el protocolo y el tipo de tráfico**, le asigna un **nivel de riesgo** y publica cada paquete como JSON en un canal **Redis Pub/Sub** para que otros servicios lo analicen.
 
 ---
 
 ## Cómo funciona
 
 ```
-Interfaz de red ──libpcap──▶ NetworkCapture ──PacketInfo──▶ RedisPublisher ──PUBLISH──▶ Redis (canal: network_events)
+Interfaz de red ─libpcap─▶ parse_ethernet_ipv4 ─▶ classify ─▶ RedisPublisher ─PUBLISH─▶ Redis (network_events)
 ```
 
 | Componente | Archivo | Responsabilidad |
 |---|---|---|
-| `PacketInfo` | `include/capture.h` | Estructura con los datos del paquete |
-| `NetworkCapture` | `src/capture.cpp` | Captura con libpcap (modo promiscuo, filtro BPF `ip`) y extrae IP, puertos y protocolo (TCP/UDP/OTHER) |
-| `RedisPublisher` | `src/redis_publisher.cpp` | Serializa a JSON y publica con hiredis |
-| `main` | `src/main.cpp` | Punto de entrada, bucle principal y cierre limpio con `Ctrl+C` |
+| `PacketInfo` + parser | `include/capture.h`, `src/capture.cpp` | Interpreta la trama (Ethernet/VLAN → IPv4 → TCP/UDP/ICMP) con comprobación de límites |
+| `NetworkCapture` | `src/capture.cpp` | Captura con libpcap en modo promiscuo; elige la interfaz activa o la indicada |
+| `classify()` | `src/classifier.cpp` | Protocolo de aplicación, categoría y riesgo |
+| `RedisPublisher` | `src/redis_publisher.cpp` | Serializa a JSON y publica con hiredis; reconecta si Redis se cae |
+| `main` | `src/main.cpp` | Bucle principal, salida por consola con colores y cierre limpio con `Ctrl+C` |
 
-### Formato del evento publicado
+---
+
+## Identificación del tráfico
+
+### Protocolo (ya no existe `OTHER`)
+
+El sensor lee el número de protocolo IP y lo nombra: `TCP`, `UDP`, `ICMP`, `IGMP`, `GRE`, `ESP`, `AH`, `OSPF`, `VRRP`, `SCTP`, `IPIP`, `IPV6`; cualquier otro se publica como `IP-<n>` (por ejemplo `IP-200`).
+
+### Protocolo de aplicación y categoría
+
+Se deducen por el puerto (el destino primero, y si no, el origen para identificar respuestas) y se distinguen TCP de UDP (443/TCP es HTTPS; 443/UDP es QUIC). Ejemplos:
+
+| Tráfico | `app_protocol` | `category` |
+|---|---|---|
+| TCP 443 | HTTPS | web |
+| UDP 53 | DNS | resolucion_dns |
+| UDP 123 | NTP | sincronizacion_hora |
+| UDP 1900 / 5353 | SSDP/UPnP / mDNS | descubrimiento |
+| TCP 22 | SSH | acceso_remoto |
+| TCP 445 | SMB | compartir_archivos |
+| TCP 3306 | MySQL | base_de_datos |
+| ICMP tipo 8 | Echo Request (ping) | diagnostico_red |
+| IP 47 | Túnel GRE | tunel |
+
+El catálogo completo está en `src/classifier.cpp` (más de 60 servicios).
+
+### Nivel de riesgo (`LOW` / `MEDIUM` / `HIGH`)
+
+| Nivel | Significado | Ejemplos |
+|---|---|---|
+| `LOW` | Tráfico esperado | HTTPS, DNS, NTP, mDNS, ping normal |
+| `MEDIUM` | A vigilar: servicios sin cifrar, administración remota o servicios expuestos | SSH, RDP, SMB, FTP, bases de datos, LLMNR, túneles GRE, FIN sin ACK |
+| `HIGH` | Indicador de amenaza | Telnet, puertos de backdoors (4444, 31337, 12345), API de Docker sin TLS, flags TCP inválidos (NULL, XMAS, SYN+FIN, SYN+RST) |
+
+Cada paquete incluye además `risk_reason` con el motivo en lenguaje claro.
+
+> **Alcance:** la clasificación es **por paquete**, basada en puertos, protocolo IP y flags TCP; no inspecciona el contenido. Un paquete a SSH no es un ataque en sí mismo: es un indicador a vigilar. Las decisiones que requieren memoria (escaneo de puertos, fuerza bruta, ráfagas) se toman en el servicio de análisis, que consume estos eventos.
+
+---
+
+## Formato del evento publicado
 
 ```json
 {
-  "src_ip": "172.24.208.167",
-  "dst_ip": "185.125.190.121",
-  "src_port": 55419,
-  "dst_port": 123,
-  "protocol": "UDP",
-  "length": 230,
-  "timestamp": 1793759054
+  "src_ip": "10.0.0.5",
+  "dst_ip": "10.0.0.9",
+  "src_port": 50000,
+  "dst_port": 22,
+  "protocol": "TCP",
+  "length": 74,
+  "timestamp": 1793759054,
+  "app_protocol": "SSH",
+  "category": "acceso_remoto",
+  "risk": "MEDIUM",
+  "risk_reason": "Administración remota: objetivo habitual de fuerza bruta",
+  "tcp_flags": "SYN"
 }
 ```
+
+Los siete primeros campos son el contrato base del proyecto. `tcp_flags` aparece solo en TCP e `icmp_type` solo en ICMP.
 
 ---
 
 ## Requisitos
 
 - Linux (Ubuntu 22.04 o superior) o Windows con **WSL2 + Ubuntu**
-- Compilador con soporte C++17, CMake ≥ 3.16
+- Compilador C++17, CMake ≥ 3.16
 - Docker (solo para levantar Redis de prueba)
 
 ```bash
@@ -44,33 +92,34 @@ sudo apt update
 sudo apt install -y build-essential cmake pkg-config libpcap-dev libhiredis-dev
 ```
 
-> ⚠️ **Usuarios de WSL2:** clona el repositorio **dentro del sistema de archivos de Linux** (por ejemplo `~/omniguard-sensor-cpp`), no en `/mnt/c/...` ni en carpetas de OneDrive. CMake falla con `Operation not permitted` en esas rutas.
+> ⚠️ **Usuarios de WSL2:** clona el repositorio **dentro del sistema de archivos de Linux** (por ejemplo `~/omniguard-sensor-cpp`), no en `/mnt/c/...` ni en OneDrive. CMake falla con `Operation not permitted` en esas rutas.
 
 ---
 
-## Compilación
+## Compilación y pruebas
 
 ```bash
 git clone <URL_DEL_REPOSITORIO>
 cd omniguard-sensor-cpp
 mkdir build && cd build
-cmake .. && make -j$(nproc)
+cmake -DBUILD_TESTS=ON .. && make -j$(nproc)
+./classifier_test        # debe imprimir: OK: todas las pruebas pasaron
 ```
 
-Resultado esperado: `[100%] Built target omniguard-sensor`.
+Las pruebas unitarias construyen paquetes de ejemplo (SSH, Telnet, escaneos NULL/XMAS, ICMP, GRE, protocolo desconocido, tramas truncadas) y verifican el parser y el clasificador sin necesidad de red. Sin `-DBUILD_TESTS=ON` solo se compila el sensor.
 
 ---
 
 ## Ejecución
 
-**1. Levantar Redis**
+**1. Redis**
 
 ```bash
 docker run --name redis-temp -p 6379:6379 -d redis:alpine
-docker exec -it redis-temp redis-cli ping      # debe responder: PONG
+docker exec -it redis-temp redis-cli ping      # PONG
 ```
 
-Si el contenedor ya existe: `docker start redis-temp`.
+Si ya existe: `docker start redis-temp`.
 
 **2. Escuchar el canal (terminal aparte)**
 
@@ -78,33 +127,55 @@ Si el contenedor ya existe: `docker start redis-temp`.
 docker exec -it redis-temp redis-cli SUBSCRIBE network_events
 ```
 
-**3. Ejecutar el sensor** (requiere `sudo` para capturar paquetes)
+**3. Sensor** (requiere `sudo`)
 
 ```bash
-#Para entrar en windows :
-wsl -d Ubuntu
-cd ~/omniguard-soc/omniguard-sensor-cpp
-
-sudo ./build/omniguard-sensor
+sudo ./build/omniguard-sensor              # interfaz automática
+sudo ./build/omniguard-sensor eth0         # o indicando la interfaz
 ```
 
-Salida esperada:
+Salida esperada (MEDIUM en amarillo y HIGH en rojo cuando hay terminal):
 
 ```
 [REDIS] Conectado a 127.0.0.1:6379
+[SENSOR] Filtro BPF: ip
 [SENSOR] Interfaz activa: eth0
 [SENSOR] Capturando en canal 'network_events'
-[PKT #1] 172.24.208.167:55419 → 185.125.190.121:123 [UDP] len=230
+
+[PKT #1] 172.24.208.167:55419 → 185.125.190.121:123 [UDP] NTP · sincronizacion_hora · LOW len=230
+[PKT #2] 172.24.208.167:48212 → 10.0.0.9:22 [TCP] SSH · acceso_remoto · MEDIUM len=74
+    ↳ Administración remota: objetivo habitual de fuerza bruta
 ```
 
-**4. Generar tráfico de prueba** (desde la terminal de Ubuntu, no desde Windows):
+Al detenerlo con `Ctrl+C` muestra un resumen: total de paquetes, cuántos LOW/MEDIUM/HIGH y fallos de publicación en Redis.
+
+**4. Generar tráfico variado** (desde la terminal de Ubuntu):
 
 ```bash
-curl -s https://example.com > /dev/null
-ping -c 3 8.8.8.8
+curl -s https://example.com > /dev/null      # HTTPS (LOW)
+curl -s http://example.com  > /dev/null      # HTTP (LOW, sin cifrar)
+ping -c 3 8.8.8.8                            # ICMP Echo (LOW)
+nc -zv 172.24.208.1 22 23 3389               # SSH, Telnet, RDP (MEDIUM/HIGH)
 ```
 
-Cada paquete capturado aparece en el sensor como `[PKT #n]` y como un JSON en la terminal del paso 2. Para detener el sensor, `Ctrl+C`.
+Para ver los flags inválidos, escanea únicamente **equipos propios** (por ejemplo la puerta de enlace de WSL, que es tu Windows):
+
+```bash
+sudo apt install -y nmap
+sudo nmap -sX -p 20-30 172.24.208.1          # escaneo XMAS → HIGH / reconocimiento
+sudo nmap -sN -p 20-30 172.24.208.1          # escaneo NULL  → HIGH / reconocimiento
+```
+
+---
+
+## Variables de entorno (opcionales)
+
+| Variable | Por defecto | Descripción |
+|---|---|---|
+| `INTERFACE` | automática | Interfaz a capturar (el argumento tiene prioridad) |
+| `REDIS_HOST` | `127.0.0.1` | Host de Redis |
+| `REDIS_PORT` | `6379` | Puerto de Redis |
+| `BPF_FILTER` | `ip` | Filtro BPF; por ejemplo `ip and not port 6379` si Redis está en la interfaz capturada |
 
 ---
 
@@ -113,31 +184,39 @@ Cada paquete capturado aparece en el sensor como `[PKT #n]` y como un JSON en la
 | Síntoma | Causa | Solución |
 |---|---|---|
 | `configure_file: Operation not permitted` | Proyecto en `/mnt/c` u OneDrive | Mover el proyecto a `~/` |
-| `Could not find PCAP_LIB` | Búsqueda de libpcap con `find_library` | Instalar `libpcap-dev` y `pkg-config`; el `CMakeLists.txt` usa `pkg_check_modules` |
-| `sudo: not found` / `apt: command not found` | Terminal incorrecta (Git Bash o WSL interno de Docker) | Usar la terminal de Ubuntu (`wsl -d Ubuntu`) |
-| El sensor no conecta a Redis | Contenedor detenido | `docker start redis-temp` y verificar con `docker ps` |
+| `Could not find PCAP_LIB` | Búsqueda de libpcap | Instalar `libpcap-dev` y `pkg-config`; el CMake usa `pkg_check_modules` |
+| `sudo: not found` / `apt: command not found` | Terminal incorrecta (Git Bash o WSL de Docker) | Usar la terminal de Ubuntu |
+| `command not found: ./build/omniguard-sensor` | No se compiló en esa carpeta | Compilar en `~/` y ejecutar desde allí |
+| `No se pudo conectar a Redis` | Contenedor detenido | `docker start redis-temp` |
+| `No se pudo abrir '<iface>'` | Faltan privilegios o la interfaz no existe | Usar `sudo` y comprobar con `ip -br link` |
 | No se ve el tráfico del `curl` | Ejecutado en Windows/Git Bash | Ejecutarlo en la terminal de Ubuntu |
-| `Permission denied` al capturar | Faltan privilegios | Ejecutar con `sudo` |
 
 ---
 
 ## Limitaciones conocidas
 
-- **En WSL2 solo se captura la interfaz virtual `eth0` de Linux**, no la tarjeta Wi-Fi/Ethernet de Windows. Para vigilar una red real se necesita un host Linux nativo o una VM con interfaz en modo *bridge*.
-- Solo se captura **IPv4** (filtro BPF `ip`).
-- La conexión a Redis está fija en `127.0.0.1:6379` y la interfaz se selecciona automáticamente.
-- Si Redis estuviera en la misma interfaz que se captura, convendría usar el filtro `ip and not port 6379` para evitar que el sensor capture su propio tráfico.
+- **En WSL2 solo se captura la interfaz virtual de Linux**, no la tarjeta Wi-Fi/Ethernet de Windows. Para vigilar una red real, el sensor debe correr en un host Linux nativo, idealmente como gateway o punto de acceso.
+- En una red Wi-Fi, un equipo solo ve su propio tráfico más el broadcast y multicast; para ver otros dispositivos debe ser el gateway o conectarse a un puerto espejo.
+- Solo **IPv4** y enlaces **Ethernet** (otros tipos de enlace se rechazan con un mensaje claro).
+- El servicio se deduce por el **puerto**: un servicio en un puerto no estándar aparecerá como `Desconocido`, y un puerto conocido no garantiza el protocolo real.
+- Captura solo cabeceras (`snaplen` de 128 bytes), por lo que no se guarda el contenido de los usuarios.
+- Capturar tráfico de terceros requiere **autorización expresa**: usa el sensor solo en redes propias o con permiso.
 
 ---
 
 ## Hoja de ruta
 
-- [x] Captura de paquetes IPv4 con libpcap
-- [x] Publicación de eventos JSON en Redis
-- [x] Cierre limpio con señales
-- [ ] Configuración por variables de entorno (`REDIS_HOST`, `REDIS_PORT`, `INTERFACE`)
-- [ ] Filtro BPF configurable
+- [x] Captura de paquetes IPv4 con libpcap y publicación JSON en Redis
+- [x] Identificación de protocolo (sin `OTHER`), categoría y nivel de riesgo
+- [x] Detección de flags TCP inválidos (NULL, XMAS, SYN+FIN, SYN+RST)
+- [x] Interfaz, Redis y filtro BPF configurables
+- [x] Pruebas unitarias del parser y del clasificador
+- [ ] Soporte IPv6
 - [ ] Dockerfile (`network_mode: host`, capacidades `NET_RAW` y `NET_ADMIN`)
 - [ ] Integración en el `docker-compose.yml` maestro (`omniguard-infra`)
 
 ---
+
+## Autor
+
+_Tu nombre_ — Proyecto OmniGuard SOC
