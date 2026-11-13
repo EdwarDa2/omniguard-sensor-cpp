@@ -1,81 +1,102 @@
 #include "redis_publisher.h"
+
+#include <hiredis/hiredis.h>
+
+#include <cstdio>
 #include <iostream>
 #include <sstream>
-#include <iomanip>
 
-// ── Constructor ───────────────────────────────────────────────────────────────
-RedisPublisher::RedisPublisher(const std::string& host, int port)
-{
-    struct timeval timeout = {2, 0}; // 2 segundos de timeout
-    ctx_ = redisConnectWithTimeout(host.c_str(), port, timeout);
+namespace {
 
-    if (!ctx_ || ctx_->err) {
-        std::cerr << "[REDIS] Error de conexión: "
-                  << (ctx_ ? ctx_->errstr : "no se pudo alocar contexto")
-                  << "\n";
-        if (ctx_) {
-            redisFree(ctx_);
-            ctx_ = nullptr;
+std::string json_escape(const std::string& s) {
+    std::string o;
+    o.reserve(s.size() + 2);
+    for (unsigned char c : s) {
+        switch (c) {
+            case '"': o += "\\\""; break;
+            case '\\': o += "\\\\"; break;
+            case '\n': o += "\\n"; break;
+            case '\r': o += "\\r"; break;
+            case '\t': o += "\\t"; break;
+            default:
+                if (c < 0x20) {
+                    char b[8];
+                    std::snprintf(b, sizeof(b), "\\u%04x", c);
+                    o += b;
+                } else {
+                    o += static_cast<char>(c);
+                }
         }
-    } else {
-        std::cout << "[REDIS] Conectado a " << host << ":" << port << "\n";
     }
+    return o;
 }
 
-// ── Destructor ────────────────────────────────────────────────────────────────
-RedisPublisher::~RedisPublisher()
-{
+}  // namespace
+
+RedisPublisher::RedisPublisher(std::string host, int port, std::string channel)
+    : host_(std::move(host)), port_(port), channel_(std::move(channel)) {}
+
+RedisPublisher::~RedisPublisher() {
+    if (ctx_) redisFree(ctx_);
+}
+
+bool RedisPublisher::connect(bool verbose) {
     if (ctx_) {
         redisFree(ctx_);
         ctx_ = nullptr;
     }
-}
-
-// ── publish ───────────────────────────────────────────────────────────────────
-bool RedisPublisher::publish(const std::string& channel, const PacketInfo& pkt)
-{
-    if (!ctx_) return false;
-
-    const std::string json = to_json(pkt);
-
-    auto* reply = static_cast<redisReply*>(
-        redisCommand(ctx_, "PUBLISH %s %s", channel.c_str(), json.c_str())
-    );
-
-    if (!reply) {
-        std::cerr << "[REDIS] Error al publicar: " << ctx_->errstr << "\n";
+    last_attempt_ = std::chrono::steady_clock::now();
+    timeval tv{1, 0};
+    ctx_ = redisConnectWithTimeout(host_.c_str(), port_, tv);
+    if (!ctx_ || ctx_->err) {
+        if (verbose)
+            std::cerr << "[REDIS] No se pudo conectar a " << host_ << ":" << port_ << " - "
+                      << (ctx_ ? ctx_->errstr : "sin memoria") << "\n";
+        if (ctx_) {
+            redisFree(ctx_);
+            ctx_ = nullptr;
+        }
         return false;
     }
-
-    bool ok = (reply->type == REDIS_REPLY_INTEGER);
-    freeReplyObject(reply);
-    return ok;
+    if (verbose) std::cout << "[REDIS] Conectado a " << host_ << ":" << port_ << "\n";
+    return true;
 }
 
-// ── to_json ───────────────────────────────────────────────────────────────────
-std::string RedisPublisher::to_json(const PacketInfo& pkt) const
-{
-    // Escapado simple de strings para evitar inyección en JSON
-    auto escape = [](const std::string& s) -> std::string {
-        std::string out;
-        for (char c : s) {
-            if (c == '"')  out += "\\\"";
-            else if (c == '\\') out += "\\\\";
-            else out += c;
+std::string RedisPublisher::to_json(const PacketInfo& p) {
+    std::ostringstream j;
+    j << "{\"src_ip\":\"" << json_escape(p.src_ip) << "\""
+      << ",\"dst_ip\":\"" << json_escape(p.dst_ip) << "\""
+      << ",\"src_port\":" << p.src_port
+      << ",\"dst_port\":" << p.dst_port
+      << ",\"protocol\":\"" << json_escape(p.protocol) << "\""
+      << ",\"length\":" << p.length
+      << ",\"timestamp\":" << p.timestamp
+      << ",\"app_protocol\":\"" << json_escape(p.app_protocol) << "\""
+      << ",\"category\":\"" << json_escape(p.category) << "\""
+      << ",\"risk\":\"" << json_escape(p.risk) << "\""
+      << ",\"risk_reason\":\"" << json_escape(p.risk_reason) << "\"";
+    if (p.tcp_flag_bits >= 0) j << ",\"tcp_flags\":\"" << json_escape(p.tcp_flags) << "\"";
+    if (p.icmp_type >= 0) j << ",\"icmp_type\":" << p.icmp_type;
+    j << "}";
+    return j.str();
+}
+
+bool RedisPublisher::publish(const PacketInfo& pkt) {
+    const std::string json = to_json(pkt);
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        if (!ctx_) {
+             
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last_attempt_ < std::chrono::seconds(2) || !connect(false)) return false;
         }
-        return out;
-    };
-
-    std::ostringstream ss;
-    ss << "{"
-       << "\"src_ip\":"   << "\"" << escape(pkt.src_ip)  << "\","
-       << "\"dst_ip\":"   << "\"" << escape(pkt.dst_ip)  << "\","
-       << "\"src_port\":"          << pkt.src_port        << ","
-       << "\"dst_port\":"          << pkt.dst_port        << ","
-       << "\"protocol\":" << "\"" << escape(pkt.protocol) << "\","
-       << "\"length\":"            << pkt.packet_len      << ","
-       << "\"timestamp\":"         << pkt.timestamp
-       << "}";
-
-    return ss.str();
+        auto* reply = static_cast<redisReply*>(
+            redisCommand(ctx_, "PUBLISH %s %b", channel_.c_str(), json.data(), json.size()));
+        if (reply) {
+            freeReplyObject(reply);
+            return true;
+        }
+        redisFree(ctx_);
+        ctx_ = nullptr;
+    }
+    return false;
 }

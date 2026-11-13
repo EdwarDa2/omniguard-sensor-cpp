@@ -1,22 +1,32 @@
 #pragma once
 
+#include <chrono>
 #include <string>
-#include <hiredis/hiredis.h>
+
 #include "capture.h"
+
+struct redisContext;
 
 class RedisPublisher {
 public:
-    // host y port del contenedor Redis (por defecto: localhost:6379)
-    RedisPublisher(const std::string& host = "127.0.0.1", int port = 6379);
+    RedisPublisher(std::string host, int port, std::string channel = "network_events");
     ~RedisPublisher();
+    RedisPublisher(const RedisPublisher&) = delete;
+    RedisPublisher& operator=(const RedisPublisher&) = delete;
 
-    // Serializa PacketInfo a JSON y hace PUBLISH al canal indicado
-    bool publish(const std::string& channel, const PacketInfo& pkt);
+    bool connect(bool verbose = true);
+    bool publish(const PacketInfo& pkt);   
 
-    bool is_connected() const { return ctx_ != nullptr; }
+    const std::string& host() const { return host_; }
+    int port() const { return port_; }
+    const std::string& channel() const { return channel_; }
+
+    static std::string to_json(const PacketInfo& pkt);
 
 private:
-    std::string  to_json(const PacketInfo& pkt) const;
-
+    std::string host_;
+    int port_;
+    std::string channel_;
     redisContext* ctx_ = nullptr;
+    std::chrono::steady_clock::time_point last_attempt_{};
 };
