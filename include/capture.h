@@ -1,49 +1,57 @@
 #pragma once
 
-#include <string>
-#include <functional>
 #include <pcap.h>
-#include <netinet/ip.h>
-#include <netinet/tcp.h>
-#include <netinet/udp.h>
-#include <net/ethernet.h>
-#include <arpa/inet.h>
 
-// Datos extraídos de cada paquete capturado
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <string>
+
+ 
 struct PacketInfo {
     std::string src_ip;
     std::string dst_ip;
-    int         src_port  = 0;
-    int         dst_port  = 0;
-    std::string protocol;       // "TCP" | "UDP" | "OTHER"
-    int         packet_len = 0;
-    long long   timestamp  = 0; // epoch en segundos
+    uint16_t src_port = 0;
+    uint16_t dst_port = 0;
+    std::string protocol = "UNKNOWN";   
+    uint8_t ip_proto = 0;               
+    uint32_t length = 0;                
+    int tcp_flag_bits = -1;             
+    std::string tcp_flags;              
+    int icmp_type = -1;
+    int icmp_code = -1;
+
+     
+    std::string app_protocol = "Desconocido";
+    std::string category = "desconocido";
+    std::string risk = "LOW";           
+    std::string risk_reason;
 };
 
-// Callback que se invoca por cada paquete procesado
-using PacketCallback = std::function<void(const PacketInfo&)>;
+ 
+bool parse_ethernet_ipv4(const uint8_t* data, size_t caplen, uint32_t origlen,
+                         int64_t timestamp, PacketInfo& out);
 
 class NetworkCapture {
 public:
-    // Abre la interfaz de red (p.ej. "eth0", "wlan0").
-    // Pasa "" para que libpcap elija la primera activa.
-    explicit NetworkCapture(const std::string& interface = "");
+    using PacketHandler = std::function<void(const PacketInfo&)>;
+
+    
+    explicit NetworkCapture(std::string interface_name = "");
     ~NetworkCapture();
+    NetworkCapture(const NetworkCapture&) = delete;
+    NetworkCapture& operator=(const NetworkCapture&) = delete;
 
-    // Inicia la captura: procesa 'count' paquetes y llama a 'cb' por cada uno.
-    // count = -1 → captura indefinida hasta llamar a stop().
-    void start(int count, PacketCallback cb);
+    bool open();
+    void run(PacketHandler handler);   
     void stop();
-
-    // Devuelve la interfaz que se está usando
-    const std::string& active_interface() const { return iface_; }
+    const std::string& interface_name() const { return iface_; }
 
 private:
-    static void pcap_handler(u_char* user,
-                             const struct pcap_pkthdr* header,
-                             const u_char* packet);
+    static void trampoline(u_char* user, const struct pcap_pkthdr* h, const u_char* bytes);
+    static std::string pick_interface(std::string& err);
 
-    pcap_t*       handle_ = nullptr;
-    std::string   iface_;
-    PacketCallback callback_;
+    std::string iface_;
+    pcap_t* handle_ = nullptr;
+    PacketHandler handler_;
 };

@@ -1,134 +1,220 @@
 #include "capture.h"
-#include <iostream>
-#include <stdexcept>
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+
+#include <cstdlib>
 #include <cstring>
-#include <ctime>
+#include <iostream>
 
-// ── Constructor ───────────────────────────────────────────────────────────────
-NetworkCapture::NetworkCapture(const std::string& interface)
-{
-    char errbuf[PCAP_ERRBUF_SIZE] = {};
+#include "classifier.h"
 
-    // Si no se especifica interfaz, libpcap elige la primera activa
-    if (interface.empty()) {
-        pcap_if_t* devs = nullptr;
-        if (pcap_findalldevs(&devs, errbuf) == -1 || devs == nullptr) {
-            throw std::runtime_error(
-                std::string("No se encontró interfaz de red: ") + errbuf);
+namespace {
+
+constexpr uint8_t kFin = 0x01, kSyn = 0x02, kRst = 0x04, kPsh = 0x08, kAck = 0x10, kUrg = 0x20;
+
+std::string flags_to_string(uint8_t bits) {
+    std::string s;
+    auto add = [&](uint8_t mask, const char* name) {
+        if (bits & mask) {
+            if (!s.empty()) s += ",";
+            s += name;
         }
-        iface_ = devs->name;
-        pcap_freealldevs(devs);
-    } else {
-        iface_ = interface;
-    }
-
-    // Abre la interfaz en modo promiscuo, timeout 1000 ms
-    handle_ = pcap_open_live(iface_.c_str(), 65535, 1, 1000, errbuf);
-    if (!handle_) {
-        throw std::runtime_error(
-            std::string("pcap_open_live falló en '") + iface_ + "': " + errbuf);
-    }
-
-    // Solo capturamos paquetes IPv4
-    struct bpf_program fp{};
-    const char* filter = "ip";
-    if (pcap_compile(handle_, &fp, filter, 0, PCAP_NETMASK_UNKNOWN) == -1 ||
-        pcap_setfilter(handle_, &fp) == -1)
-    {
-        std::cerr << "[WARN] No se pudo aplicar filtro BPF: "
-                  << pcap_geterr(handle_) << "\n";
-    }
-    pcap_freecode(&fp);
-
-    std::cout << "[SENSOR] Interfaz activa: " << iface_ << "\n";
+    };
+    add(kSyn, "SYN");
+    add(kAck, "ACK");
+    add(kFin, "FIN");
+    add(kRst, "RST");
+    add(kPsh, "PSH");
+    add(kUrg, "URG");
+    return s.empty() ? "NONE" : s;
 }
 
-// ── Destructor ────────────────────────────────────────────────────────────────
-NetworkCapture::~NetworkCapture()
-{
-    if (handle_) {
+std::string protocol_name(uint8_t p) {
+    switch (p) {
+        case 1: return "ICMP";
+        case 2: return "IGMP";
+        case 4: return "IPIP";
+        case 6: return "TCP";
+        case 17: return "UDP";
+        case 41: return "IPV6";
+        case 47: return "GRE";
+        case 50: return "ESP";
+        case 51: return "AH";
+        case 89: return "OSPF";
+        case 112: return "VRRP";
+        case 132: return "SCTP";
+        default: return "IP-" + std::to_string(p);
+    }
+}
+
+std::string ip_to_string(const uint8_t* b) {
+    char buf[INET_ADDRSTRLEN];
+    in_addr a;
+    std::memcpy(&a, b, 4);
+    inet_ntop(AF_INET, &a, buf, sizeof(buf));
+    return buf;
+}
+
+uint16_t be16(const uint8_t* p) { return static_cast<uint16_t>((p[0] << 8) | p[1]); }
+
+}   
+
+bool parse_ethernet_ipv4(const uint8_t* d, size_t caplen, uint32_t origlen, int64_t ts,
+                         PacketInfo& out) {
+    size_t off = 14;
+    if (caplen < off) return false;
+    uint16_t ethertype = be16(d + 12);
+    if (ethertype == 0x8100 || ethertype == 0x88A8) {   
+        if (caplen < off + 4) return false;
+        ethertype = be16(d + 16);
+        off += 4;
+    }
+    if (ethertype != 0x0800) return false;   
+    if (caplen < off + 20) return false;
+
+    const uint8_t* ip = d + off;
+    if ((ip[0] >> 4) != 4) return false;
+    const size_t ihl = static_cast<size_t>(ip[0] & 0x0F) * 4;
+    if (ihl < 20 || caplen < off + ihl) return false;
+
+    out = PacketInfo{};
+    out.ip_proto = ip[9];
+    out.protocol = protocol_name(out.ip_proto);
+    out.src_ip = ip_to_string(ip + 12);
+    out.dst_ip = ip_to_string(ip + 16);
+    out.length = origlen;
+    out.timestamp = ts;
+
+    const uint16_t frag_offset = static_cast<uint16_t>(((ip[6] & 0x1F) << 8) | ip[7]);
+    const uint8_t* l4 = ip + ihl;
+    const size_t l4len = caplen - off - ihl;
+
+    if (frag_offset != 0) return true;   
+
+    switch (out.ip_proto) {
+        case 6:  // TCP
+            if (l4len >= 4) {
+                out.src_port = be16(l4);
+                out.dst_port = be16(l4 + 2);
+            }
+            if (l4len >= 14) {
+                out.tcp_flag_bits = l4[13];
+                out.tcp_flags = flags_to_string(l4[13]);
+            }
+            break;
+        case 17:  // UDP
+            if (l4len >= 4) {
+                out.src_port = be16(l4);
+                out.dst_port = be16(l4 + 2);
+            }
+            break;
+        case 1:  // ICMP
+            if (l4len >= 2) {
+                out.icmp_type = l4[0];
+                out.icmp_code = l4[1];
+            }
+            break;
+        default:
+            break;
+    }
+    return true;
+}
+
+NetworkCapture::NetworkCapture(std::string interface_name) : iface_(std::move(interface_name)) {}
+
+NetworkCapture::~NetworkCapture() {
+    if (handle_) pcap_close(handle_);
+}
+
+std::string NetworkCapture::pick_interface(std::string& err) {
+    pcap_if_t* devs = nullptr;
+    char errbuf[PCAP_ERRBUF_SIZE] = {0};
+    if (pcap_findalldevs(&devs, errbuf) != 0) {
+        err = errbuf;
+        return "";
+    }
+    std::string chosen;
+    for (pcap_if_t* d = devs; d; d = d->next) {
+        if (!(d->flags & PCAP_IF_UP) || !(d->flags & PCAP_IF_RUNNING)) continue;
+        if (d->flags & PCAP_IF_LOOPBACK) continue;
+        if (std::strcmp(d->name, "any") == 0) continue;
+        for (pcap_addr_t* a = d->addresses; a; a = a->next) {
+            if (a->addr && a->addr->sa_family == AF_INET) {
+                chosen = d->name;
+                break;
+            }
+        }
+        if (!chosen.empty()) break;
+    }
+    pcap_freealldevs(devs);
+    if (chosen.empty())
+        err = "No se encontró una interfaz activa con IPv4. Indica una: ./omniguard-sensor <interfaz>";
+    return chosen;
+}
+
+bool NetworkCapture::open() {
+    std::string err;
+    if (iface_.empty()) {
+        iface_ = pick_interface(err);
+        if (iface_.empty()) {
+            std::cerr << "[SENSOR] " << err << "\n";
+            return false;
+        }
+    }
+
+    char errbuf[PCAP_ERRBUF_SIZE] = {0};
+     
+    handle_ = pcap_open_live(iface_.c_str(), 128, 1, 1000, errbuf);
+    if (!handle_) {
+        std::cerr << "[SENSOR] No se pudo abrir '" << iface_ << "': " << errbuf
+                  << " (¿ejecutaste con sudo?)\n";
+        return false;
+    }
+    if (pcap_datalink(handle_) != DLT_EN10MB) {
+        std::cerr << "[SENSOR] La interfaz '" << iface_
+                  << "' no usa enlace Ethernet (DLT_EN10MB); no soportada.\n";
         pcap_close(handle_);
         handle_ = nullptr;
+        return false;
     }
+
+    const char* env = std::getenv("BPF_FILTER");
+    const std::string filter = (env && *env) ? env : "ip";
+    bpf_program fp;
+    if (pcap_compile(handle_, &fp, filter.c_str(), 1, PCAP_NETMASK_UNKNOWN) == -1) {
+        std::cerr << "[SENSOR] Filtro BPF inválido '" << filter << "': " << pcap_geterr(handle_) << "\n";
+        pcap_close(handle_);
+        handle_ = nullptr;
+        return false;
+    }
+    const int rc = pcap_setfilter(handle_, &fp);
+    pcap_freecode(&fp);
+    if (rc == -1) {
+        std::cerr << "[SENSOR] No se pudo aplicar el filtro: " << pcap_geterr(handle_) << "\n";
+        pcap_close(handle_);
+        handle_ = nullptr;
+        return false;
+    }
+    std::cout << "[SENSOR] Filtro BPF: " << filter << "\n";
+    return true;
 }
 
-// ── start ─────────────────────────────────────────────────────────────────────
-void NetworkCapture::start(int count, PacketCallback cb)
-{
-    callback_ = std::move(cb);
-    // Pasamos 'this' como user data al handler estático
-    pcap_loop(handle_, count,
-              NetworkCapture::pcap_handler,
-              reinterpret_cast<u_char*>(this));
+void NetworkCapture::run(PacketHandler handler) {
+    handler_ = std::move(handler);
+    pcap_loop(handle_, -1, &NetworkCapture::trampoline, reinterpret_cast<u_char*>(this));
 }
 
-void NetworkCapture::stop()
-{
+void NetworkCapture::stop() {
     if (handle_) pcap_breakloop(handle_);
 }
 
-// ── Handler estático (invocado por libpcap) ───────────────────────────────────
-void NetworkCapture::pcap_handler(u_char*                  user,
-                                   const struct pcap_pkthdr* header,
-                                   const u_char*             packet)
-{
+void NetworkCapture::trampoline(u_char* user, const struct pcap_pkthdr* h, const u_char* bytes) {
     auto* self = reinterpret_cast<NetworkCapture*>(user);
     PacketInfo info;
-    info.packet_len = static_cast<int>(header->len);
-    info.timestamp  = static_cast<long long>(header->ts.tv_sec);
-
-    // ── Cabecera Ethernet (14 bytes) ──────────────────────────────────────────
-    if (header->len < sizeof(struct ether_header)) return;
-    const auto* eth = reinterpret_cast<const struct ether_header*>(packet);
-
-    // Solo IPv4 (0x0800)
-    if (ntohs(eth->ether_type) != ETHERTYPE_IP) return;
-
-    // ── Cabecera IP ───────────────────────────────────────────────────────────
-    const u_char* ip_ptr = packet + sizeof(struct ether_header);
-    if (header->len < sizeof(struct ether_header) + sizeof(struct ip)) return;
-
-    const auto* ip_hdr = reinterpret_cast<const struct ip*>(ip_ptr);
-    info.src_ip = inet_ntoa(ip_hdr->ip_src);
-    info.dst_ip = inet_ntoa(ip_hdr->ip_dst);
-
-    int ip_hdr_len = ip_hdr->ip_hl * 4; // en bytes
-
-    // ── Protocolo de transporte ───────────────────────────────────────────────
-    const u_char* transport_ptr = ip_ptr + ip_hdr_len;
-
-    switch (ip_hdr->ip_p) {
-        case IPPROTO_TCP: {
-            info.protocol = "TCP";
-            if (header->len >= sizeof(struct ether_header) +
-                               static_cast<size_t>(ip_hdr_len) +
-                               sizeof(struct tcphdr))
-            {
-                const auto* tcp =
-                    reinterpret_cast<const struct tcphdr*>(transport_ptr);
-                info.src_port = ntohs(tcp->th_sport);
-                info.dst_port = ntohs(tcp->th_dport);
-            }
-            break;
-        }
-        case IPPROTO_UDP: {
-            info.protocol = "UDP";
-            if (header->len >= sizeof(struct ether_header) +
-                               static_cast<size_t>(ip_hdr_len) +
-                               sizeof(struct udphdr))
-            {
-                const auto* udp =
-                    reinterpret_cast<const struct udphdr*>(transport_ptr);
-                info.src_port = ntohs(udp->uh_sport);
-                info.dst_port = ntohs(udp->uh_dport);
-            }
-            break;
-        }
-        default:
-            info.protocol = "OTHER";
-            break;
+    if (parse_ethernet_ipv4(bytes, h->caplen, h->len, h->ts.tv_sec, info)) {
+        classify(info);
+        if (self->handler_) self->handler_(info);
     }
-
-    // Invoca el callback registrado
-    if (self->callback_) self->callback_(info);
 }
