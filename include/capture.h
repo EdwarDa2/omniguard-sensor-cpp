@@ -16,6 +16,7 @@ struct PacketInfo {
     std::string protocol = "UNKNOWN";   
     uint8_t ip_proto = 0;               
     uint32_t length = 0;                
+    int64_t timestamp = 0;
     int tcp_flag_bits = -1;             
     std::string tcp_flags;              
     int icmp_type = -1;
