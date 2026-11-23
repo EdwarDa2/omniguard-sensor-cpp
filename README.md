@@ -73,11 +73,32 @@ Cada paquete incluye además `risk_reason` con el motivo en lenguaje claro.
   "category": "acceso_remoto",
   "risk": "MEDIUM",
   "risk_reason": "Administración remota: objetivo habitual de fuerza bruta",
-  "tcp_flags": "SYN"
+  "tcp_flags": "SYN",
+  "product_version": "9.2",
+  "cpe_name": "cpe:2.3:a:openbsd:openssh:9.2:*:*:*:*:*:*:*"
 }
 ```
 
-Los siete primeros campos son el contrato base del proyecto. `tcp_flags` aparece solo en TCP e `icmp_type` solo en ICMP.
+Los campos base siguen siendo el contrato mínimo. `tcp_flags` aparece solo en TCP,
+`icmp_type` solo en ICMP y `product_version`/`cpe_name` solo cuando existe evidencia.
+
+### Descubrimiento pasivo de versiones
+
+Cuando una respuesta TCP contiene un banner SSH verificable, el sensor puede extraer
+`OpenSSH_<versión>` y publicar su CPE para NVD.
+
+Ejemplo:
+
+```text
+SSH-2.0-OpenSSH_9.2p1
+```
+
+Resultado publicado:
+
+- `product_version`: `9.2`
+- `cpe_name`: `cpe:2.3:a:openbsd:openssh:9.2:*:*:*:*:*:*:*`
+
+No se inventan versiones ni CPE para servicios desconocidos.
 
 ---
 
@@ -211,9 +232,9 @@ sudo nmap -sN -p 20-30 172.24.208.1          # escaneo NULL  → HIGH / reconoci
 - [x] Detección de flags TCP inválidos (NULL, XMAS, SYN+FIN, SYN+RST)
 - [x] Interfaz, Redis y filtro BPF configurables
 - [x] Pruebas unitarias del parser y del clasificador
-- [ ] Soporte IPv6
-- [ ] Dockerfile (`network_mode: host`, capacidades `NET_RAW` y `NET_ADMIN`)
-- [ ] Integración en el `docker-compose.yml` maestro (`omniguard-infra`)
+- [x] Dockerfile para `network_mode: host` y permisos de red
+- [x] Integración con el `docker-compose.yml` de `omniguard-infra`
+- [x] Descubrimiento básico de CPE mediante banner OpenSSH
 
 ---
 
