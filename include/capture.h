@@ -21,6 +21,9 @@ struct PacketInfo {
     std::string tcp_flags;              
     int icmp_type = -1;
     int icmp_code = -1;
+    std::string service_banner;
+    std::string product_version;
+    std::string cpe_name;
 
      
     std::string app_protocol = "Desconocido";

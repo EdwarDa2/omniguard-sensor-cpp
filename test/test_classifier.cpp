@@ -67,6 +67,14 @@ int main() {
         CHECK(p.app_protocol == "SSH" && p.category == "acceso_remoto" && p.risk == "MEDIUM");
         CHECK(p.tcp_flags == "SYN");
     }
+    {  // SSH banner pasivo
+        Bytes l4 = tcp(50000, 22, 0x18);
+        const char banner[] = "SSH-2.0-OpenSSH_9.2p1\r\n";
+        l4.insert(l4.end(), banner, banner + sizeof(banner) - 1);
+        auto p = run(make_packet(6, "10.0.0.9", "10.0.0.5", l4));
+        CHECK(p.product_version == "9.2");
+        CHECK(p.cpe_name == "cpe:2.3:a:openbsd:openssh:9.2:*:*:*:*:*:*:*");
+    }
     {  // HTTPS y respuesta del servidor (puerto origen 443)
         auto p = run(make_packet(6, "10.0.0.5", "93.184.216.34", tcp(50000, 443, 0x10)));
         CHECK(p.app_protocol == "HTTPS" && p.risk == "LOW");

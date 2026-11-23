@@ -102,6 +102,14 @@ bool parse_ethernet_ipv4(const uint8_t* d, size_t caplen, uint32_t origlen, int6
             if (l4len >= 14) {
                 out.tcp_flag_bits = l4[13];
                 out.tcp_flags = flags_to_string(l4[13]);
+                const size_t tcp_header_len = static_cast<size_t>((l4[12] >> 4) * 4);
+                if (tcp_header_len >= 20 && l4len > tcp_header_len) {
+                    const size_t payload_len = l4len - tcp_header_len;
+                    const size_t copied = payload_len > 128 ? 128 : payload_len;
+                    out.service_banner.assign(
+                        reinterpret_cast<const char*>(l4 + tcp_header_len),
+                        copied);
+                }
             }
             break;
         case 17:  // UDP

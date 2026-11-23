@@ -1,5 +1,6 @@
 #include "classifier.h"
 
+#include <cctype>
 #include <string>
 
 namespace {
@@ -220,6 +221,31 @@ void classify(PacketInfo& p) {
     if (v.reason.empty())
         v.reason = (v.risk == LOW) ? "Tráfico habitual, sin indicios de amenaza"
                                    : "Tráfico a vigilar";
+
+    if (v.app == "SSH" && !p.service_banner.empty()) {
+        const std::string marker = "OpenSSH_";
+        const size_t marker_pos = p.service_banner.find(marker);
+        if (marker_pos != std::string::npos) {
+            const size_t start = marker_pos + marker.size();
+            size_t end = start;
+            while (end < p.service_banner.size() &&
+                   (std::isdigit(static_cast<unsigned char>(p.service_banner[end])) ||
+                    p.service_banner[end] == '.' ||
+                    p.service_banner[end] == 'p')) {
+                ++end;
+            }
+            const std::string raw_version = p.service_banner.substr(start, end - start);
+            size_t suffix = raw_version.find('p');
+            p.product_version = suffix == std::string::npos
+                ? raw_version
+                : raw_version.substr(0, suffix);
+            if (!p.product_version.empty()) {
+                p.cpe_name = "cpe:2.3:a:openbsd:openssh:" + p.product_version +
+                             ":*:*:*:*:*:*:*";
+            }
+        }
+    }
+
     p.app_protocol = v.app;
     p.category = v.category;
     p.risk = risk_name(v.risk);

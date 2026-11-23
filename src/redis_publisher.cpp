@@ -77,6 +77,10 @@ std::string RedisPublisher::to_json(const PacketInfo& p) {
       << ",\"risk_reason\":\"" << json_escape(p.risk_reason) << "\"";
     if (p.tcp_flag_bits >= 0) j << ",\"tcp_flags\":\"" << json_escape(p.tcp_flags) << "\"";
     if (p.icmp_type >= 0) j << ",\"icmp_type\":" << p.icmp_type;
+    if (!p.product_version.empty())
+        j << ",\"product_version\":\"" << json_escape(p.product_version) << "\"";
+    if (!p.cpe_name.empty())
+        j << ",\"cpe_name\":\"" << json_escape(p.cpe_name) << "\"";
     j << "}";
     return j.str();
 }
