@@ -5,6 +5,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(PkgConfig REQUIRED)
+find_package(Threads REQUIRED)
 pkg_check_modules(PCAP REQUIRED libpcap)
 pkg_check_modules(HIREDIS REQUIRED hiredis)
 
@@ -25,6 +26,7 @@ target_include_directories(omniguard-sensor PRIVATE
 target_link_libraries(omniguard-sensor PRIVATE
     ${PCAP_LIBRARIES}
     ${HIREDIS_LIBRARIES}
+    Threads::Threads
 )
 
 target_compile_options(omniguard-sensor PRIVATE -Wall -Wextra -O2)

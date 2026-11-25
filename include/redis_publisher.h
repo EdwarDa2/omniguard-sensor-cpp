@@ -1,12 +1,19 @@
 #pragma once
 
 #include <chrono>
+#include <deque>
 #include <string>
 
 #include "capture.h"
 #include "traffic_metrics.h"
 
 struct redisContext;
+
+struct HistoryPoint {
+    std::string time;
+    uint64_t inbound = 0;
+    uint64_t outbound = 0;
+};
 
 class RedisPublisher {
 public:
@@ -17,7 +24,7 @@ public:
 
     bool connect(bool verbose = true);
     bool publish(const PacketInfo& pkt);
-    bool publish_metrics(const TrafficMetricsSnapshot& metrics);
+    bool publish_metrics(const TrafficMetricsSnapshot& metrics, const std::string& sensor_status = "ACTIVE");
 
     const std::string& host() const { return host_; }
     int port() const { return port_; }
@@ -31,4 +38,5 @@ private:
     std::string channel_;
     redisContext* ctx_ = nullptr;
     std::chrono::steady_clock::time_point last_attempt_{};
+    std::deque<HistoryPoint> history_{};
 };
