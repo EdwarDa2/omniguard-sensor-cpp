@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <vector>
 
 #include "classifier.h"
 
@@ -58,6 +59,36 @@ std::string ip_to_string(const uint8_t* b) {
 }
 
 uint16_t be16(const uint8_t* p) { return static_cast<uint16_t>((p[0] << 8) | p[1]); }
+
+bool find_ipv4_addresses(const std::string& interface_name, std::vector<std::string>& addresses,
+                         std::string& err) {
+    pcap_if_t* devices = nullptr;
+    char errbuf[PCAP_ERRBUF_SIZE] = {0};
+    if (pcap_findalldevs(&devices, errbuf) != 0) {
+        err = errbuf;
+        return false;
+    }
+
+    for (pcap_if_t* device = devices; device; device = device->next) {
+        if (interface_name != device->name) continue;
+        for (pcap_addr_t* address = device->addresses; address; address = address->next) {
+            if (!address->addr || address->addr->sa_family != AF_INET) continue;
+            const auto* ipv4 = reinterpret_cast<const sockaddr_in*>(address->addr);
+            char text[INET_ADDRSTRLEN] = {0};
+            if (inet_ntop(AF_INET, &ipv4->sin_addr, text, sizeof(text))) {
+                addresses.emplace_back(text);
+            }
+        }
+        break;
+    }
+
+    pcap_freealldevs(devices);
+    if (addresses.empty()) {
+        err = "No se encontró una dirección IPv4 propia en la interfaz '" + interface_name + "'";
+        return false;
+    }
+    return true;
+}
 
 }   
 
@@ -172,9 +203,13 @@ bool NetworkCapture::open() {
         }
     }
 
+    if (!find_ipv4_addresses(iface_, local_ipv4_addresses_, err)) {
+        std::cerr << "[SENSOR] " << err << "; captura cancelada por seguridad.\n";
+        return false;
+    }
+
     char errbuf[PCAP_ERRBUF_SIZE] = {0};
-     
-    handle_ = pcap_open_live(iface_.c_str(), 128, 1, 1000, errbuf);
+    handle_ = pcap_open_live(iface_.c_str(), 128, 0, 1000, errbuf);
     if (!handle_) {
         std::cerr << "[SENSOR] No se pudo abrir '" << iface_ << "': " << errbuf
                   << " (¿ejecutaste con sudo?)\n";
@@ -189,7 +224,14 @@ bool NetworkCapture::open() {
     }
 
     const char* env = std::getenv("BPF_FILTER");
-    const std::string filter = (env && *env) ? env : "ip";
+    const std::string configured_filter = (env && *env) ? env : "ip";
+    std::string host_filter = "(";
+    for (size_t i = 0; i < local_ipv4_addresses_.size(); ++i) {
+        if (i > 0) host_filter += " or ";
+        host_filter += "host " + local_ipv4_addresses_[i];
+    }
+    host_filter += ")";
+    const std::string filter = "(" + configured_filter + ") and " + host_filter;
     bpf_program fp;
     if (pcap_compile(handle_, &fp, filter.c_str(), 1, PCAP_NETMASK_UNKNOWN) == -1) {
         std::cerr << "[SENSOR] Filtro BPF inválido '" << filter << "': " << pcap_geterr(handle_) << "\n";
@@ -209,13 +251,32 @@ bool NetworkCapture::open() {
     return true;
 }
 
-void NetworkCapture::run(PacketHandler handler) {
+void NetworkCapture::run(PacketHandler handler, TickHandler tick_handler) {
     handler_ = std::move(handler);
-    pcap_loop(handle_, -1, &NetworkCapture::trampoline, reinterpret_cast<u_char*>(this));
+    while (handle_) {
+        const int result = pcap_dispatch(
+            handle_,
+            64,
+            &NetworkCapture::trampoline,
+            reinterpret_cast<u_char*>(this));
+        if (result == PCAP_ERROR_BREAK) break;
+        if (result == PCAP_ERROR) {
+            std::cerr << "[SENSOR] Error durante la captura: " << pcap_geterr(handle_) << "\n";
+            break;
+        }
+        if (tick_handler) tick_handler();
+    }
 }
 
 void NetworkCapture::stop() {
     if (handle_) pcap_breakloop(handle_);
+}
+
+bool NetworkCapture::is_local_ipv4(const std::string& address) const {
+    for (const auto& local_address : local_ipv4_addresses_) {
+        if (address == local_address) return true;
+    }
+    return false;
 }
 
 void NetworkCapture::trampoline(u_char* user, const struct pcap_pkthdr* h, const u_char* bytes) {

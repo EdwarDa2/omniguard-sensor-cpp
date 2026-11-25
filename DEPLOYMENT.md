@@ -6,7 +6,8 @@ Consulte el plan maestro en el repositorio central:
 
 ## Rol
 
-Captura tráfico con libpcap, clasifica eventos y los publica en Redis.
+Captura tráfico propio con libpcap sin modo promiscuo, clasifica eventos y
+publica métricas en Redis.
 
 ## Variables
 
@@ -16,6 +17,10 @@ REDIS_PORT
 INTERFACE
 BPF_FILTER
 ```
+
+El sensor actualiza `metrics:traffic:latest` cada cinco segundos y establece
+un TTL de quince segundos. El filtro BPF configurado se combina siempre con
+las direcciones IPv4 propias de la interfaz; no amplía la captura a terceros.
 
 ## Producción
 

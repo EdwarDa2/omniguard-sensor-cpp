@@ -3,6 +3,7 @@
 #include <hiredis/hiredis.h>
 
 #include <cstdio>
+#include <iomanip>
 #include <iostream>
 #include <sstream>
 
@@ -96,8 +97,38 @@ bool RedisPublisher::publish(const PacketInfo& pkt) {
         auto* reply = static_cast<redisReply*>(
             redisCommand(ctx_, "PUBLISH %s %b", channel_.c_str(), json.data(), json.size()));
         if (reply) {
+            const bool success = reply->type != REDIS_REPLY_ERROR;
             freeReplyObject(reply);
-            return true;
+            return success;
+        }
+        redisFree(ctx_);
+        ctx_ = nullptr;
+    }
+    return false;
+}
+
+bool RedisPublisher::publish_metrics(const TrafficMetricsSnapshot& metrics) {
+    std::ostringstream json;
+    json << std::fixed << std::setprecision(6)
+         << "{\"packets_per_sec\":" << metrics.packets_per_sec
+         << ",\"bandwidth_mbps\":" << metrics.bandwidth_mbps
+         << ",\"sensor_status\":\"ACTIVE\""
+         << ",\"inbound\":" << metrics.inbound
+         << ",\"outbound\":" << metrics.outbound
+         << "}";
+    const std::string payload = json.str();
+
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        if (!ctx_) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last_attempt_ < std::chrono::seconds(2) || !connect(false)) return false;
+        }
+        auto* reply = static_cast<redisReply*>(
+            redisCommand(ctx_, "SETEX metrics:traffic:latest 15 %b", payload.data(), payload.size()));
+        if (reply) {
+            const bool success = reply->type != REDIS_REPLY_ERROR;
+            freeReplyObject(reply);
+            return success;
         }
         redisFree(ctx_);
         ctx_ = nullptr;

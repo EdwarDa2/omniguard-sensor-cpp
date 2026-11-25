@@ -4,6 +4,7 @@
 #include <string>
 
 #include "capture.h"
+#include "traffic_metrics.h"
 
 struct redisContext;
 
@@ -15,7 +16,8 @@ public:
     RedisPublisher& operator=(const RedisPublisher&) = delete;
 
     bool connect(bool verbose = true);
-    bool publish(const PacketInfo& pkt);   
+    bool publish(const PacketInfo& pkt);
+    bool publish_metrics(const TrafficMetricsSnapshot& metrics);
 
     const std::string& host() const { return host_; }
     int port() const { return port_; }

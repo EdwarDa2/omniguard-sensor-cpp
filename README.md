@@ -1,22 +1,24 @@
 # omniguard-sensor-cpp
 
-Sensor de red del proyecto **OmniGuard SOC** (plataforma de ciberseguridad Blue Team). Captura tráfico IPv4 con **libpcap**, **identifica el protocolo y el tipo de tráfico**, le asigna un **nivel de riesgo** y publica cada paquete como JSON en un canal **Redis Pub/Sub** para que otros servicios lo analicen.
+Sensor de red del proyecto **OmniGuard SOC** (plataforma de ciberseguridad Blue Team). Captura únicamente tráfico IPv4 propio con **libpcap** en modo no promiscuo, **identifica el protocolo y el tipo de tráfico**, le asigna un **nivel de riesgo** y publica eventos y métricas reales en Redis.
 
 ---
 
 ## Cómo funciona
 
 ```
-Interfaz de red ─libpcap─▶ parse_ethernet_ipv4 ─▶ classify ─▶ RedisPublisher ─PUBLISH─▶ Redis (network_events)
+Interfaz propia ─libpcap─▶ parse_ethernet_ipv4 ─▶ classify ─▶ Redis (network_events)
+                                              └─▶ métricas cada 5s ─SETEX─▶ Redis (metrics:traffic:latest, TTL 15s)
 ```
 
 | Componente | Archivo | Responsabilidad |
 |---|---|---|
 | `PacketInfo` + parser | `include/capture.h`, `src/capture.cpp` | Interpreta la trama (Ethernet/VLAN → IPv4 → TCP/UDP/ICMP) con comprobación de límites |
-| `NetworkCapture` | `src/capture.cpp` | Captura con libpcap en modo promiscuo; elige la interfaz activa o la indicada |
+| `NetworkCapture` | `src/capture.cpp` | Captura sin modo promiscuo y fuerza un filtro BPF limitado a las IPv4 de la interfaz |
 | `classify()` | `src/classifier.cpp` | Protocolo de aplicación, categoría y riesgo |
-| `RedisPublisher` | `src/redis_publisher.cpp` | Serializa a JSON y publica con hiredis; reconecta si Redis se cae |
-| `main` | `src/main.cpp` | Bucle principal, salida por consola con colores y cierre limpio con `Ctrl+C` |
+| `RedisPublisher` | `src/redis_publisher.cpp` | Publica eventos y telemetría con hiredis; reconecta si Redis se cae |
+| Métricas | `src/traffic_metrics.cpp` | Calcula paquetes/s, Mbps y tasas entrantes/salientes en ventanas de 5 segundos |
+| `main` | `src/main.cpp` | Captura paquetes, publica métricas y cierra con `Ctrl+C` |
 
 ---
 
@@ -124,10 +126,16 @@ git clone <URL_DEL_REPOSITORIO>
 cd omniguard-sensor-cpp
 mkdir build && cd build
 cmake -DBUILD_TESTS=ON .. && make -j$(nproc)
-./classifier_test        # debe imprimir: OK: todas las pruebas pasaron
+ctest --output-on-failure
 ```
 
 Las pruebas unitarias construyen paquetes de ejemplo (SSH, Telnet, escaneos NULL/XMAS, ICMP, GRE, protocolo desconocido, tramas truncadas) y verifican el parser y el clasificador sin necesidad de red. Sin `-DBUILD_TESTS=ON` solo se compila el sensor.
+
+La publicación y el TTL de telemetría se pueden verificar contra Redis activo:
+
+```bash
+./redis_metrics_test 127.0.0.1 6379
+```
 
 ---
 
@@ -159,7 +167,7 @@ Salida esperada (MEDIUM en amarillo y HIGH en rojo cuando hay terminal):
 
 ```
 [REDIS] Conectado a 127.0.0.1:6379
-[SENSOR] Filtro BPF: ip
+[SENSOR] Filtro BPF: (ip) and (host <IPv4 propia>)
 [SENSOR] Interfaz activa: eth0
 [SENSOR] Capturando en canal 'network_events'
 
@@ -179,13 +187,15 @@ ping -c 3 8.8.8.8                            # ICMP Echo (LOW)
 nc -zv 172.24.208.1 22 23 3389               # SSH, Telnet, RDP (MEDIUM/HIGH)
 ```
 
-Para ver los flags inválidos, escanea únicamente **equipos propios** (por ejemplo la puerta de enlace de WSL, que es tu Windows):
+Las pruebas de flags XMAS/NULL se realizan con paquetes de prueba unitarios; el
+sensor no se configura para observar ni escanear otros equipos.
 
-```bash
-sudo apt install -y nmap
-sudo nmap -sX -p 20-30 172.24.208.1          # escaneo XMAS → HIGH / reconocimiento
-sudo nmap -sN -p 20-30 172.24.208.1          # escaneo NULL  → HIGH / reconocimiento
-```
+## Telemetría Redis
+
+Cada cinco segundos el sensor publica `metrics:traffic:latest` con TTL de 15
+segundos. Incluye paquetes por segundo, ancho de banda en Mbps, tasas de
+entrada/salida y estado `ACTIVE`. Si el sensor deja de actualizar la clave,
+Redis la expira para que los consumidores puedan mostrarlo como inactivo.
 
 ---
 
@@ -196,7 +206,7 @@ sudo nmap -sN -p 20-30 172.24.208.1          # escaneo NULL  → HIGH / reconoci
 | `INTERFACE` | automática | Interfaz a capturar (el argumento tiene prioridad) |
 | `REDIS_HOST` | `127.0.0.1` | Host de Redis |
 | `REDIS_PORT` | `6379` | Puerto de Redis |
-| `BPF_FILTER` | `ip` | Filtro BPF; por ejemplo `ip and not port 6379` si Redis está en la interfaz capturada |
+| `BPF_FILTER` | `ip` | Filtro adicional; siempre se combina con `host <IPv4 propia>` y no puede ampliar el alcance |
 
 ---
 
@@ -217,7 +227,7 @@ sudo nmap -sN -p 20-30 172.24.208.1          # escaneo NULL  → HIGH / reconoci
 ## Limitaciones conocidas
 
 - **En WSL2 solo se captura la interfaz virtual de Linux**, no la tarjeta Wi-Fi/Ethernet de Windows. Para vigilar una red real, el sensor debe correr en un host Linux nativo, idealmente como gateway o punto de acceso.
-- En una red Wi-Fi, un equipo solo ve su propio tráfico más el broadcast y multicast; para ver otros dispositivos debe ser el gateway o conectarse a un puerto espejo.
+- El filtro BPF limita el sensor a paquetes cuyo origen o destino sea una IPv4 asignada a la interfaz; no captura tráfico de tránsito de otros equipos.
 - Solo **IPv4** y enlaces **Ethernet** (otros tipos de enlace se rechazan con un mensaje claro).
 - El servicio se deduce por el **puerto**: un servicio en un puerto no estándar aparecerá como `Desconocido`, y un puerto conocido no garantiza el protocolo real.
 - Captura solo cabeceras (`snaplen` de 128 bytes), por lo que no se guarda el contenido de los usuarios.
@@ -228,6 +238,7 @@ sudo nmap -sN -p 20-30 172.24.208.1          # escaneo NULL  → HIGH / reconoci
 ## Hoja de ruta
 
 - [x] Captura de paquetes IPv4 con libpcap y publicación JSON en Redis
+- [x] Captura restringida al host y telemetría real en Redis con TTL
 - [x] Identificación de protocolo (sin `OTHER`), categoría y nivel de riesgo
 - [x] Detección de flags TCP inválidos (NULL, XMAS, SYN+FIN, SYN+RST)
 - [x] Interfaz, Redis y filtro BPF configurables

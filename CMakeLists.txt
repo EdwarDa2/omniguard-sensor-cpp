@@ -12,6 +12,7 @@ add_executable(omniguard-sensor
     src/main.cpp
     src/capture.cpp
     src/classifier.cpp
+    src/traffic_metrics.cpp
     src/redis_publisher.cpp
 )
 
@@ -44,4 +45,27 @@ if(BUILD_TESTS)
     target_compile_options(classifier_test PRIVATE -Wall -Wextra)
     enable_testing()
     add_test(NAME classifier COMMAND classifier_test)
+
+    add_executable(traffic_metrics_test
+        test/test_traffic_metrics.cpp
+        src/traffic_metrics.cpp
+    )
+    target_include_directories(traffic_metrics_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+    target_compile_options(traffic_metrics_test PRIVATE -Wall -Wextra)
+    add_test(NAME traffic_metrics COMMAND traffic_metrics_test)
+
+    add_executable(redis_metrics_test
+        test/test_redis_metrics.cpp
+        src/redis_publisher.cpp
+    )
+    target_include_directories(redis_metrics_test PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${PCAP_INCLUDE_DIRS}
+        ${HIREDIS_INCLUDE_DIRS}
+    )
+    target_link_libraries(redis_metrics_test PRIVATE
+        ${PCAP_LIBRARIES}
+        ${HIREDIS_LIBRARIES}
+    )
+    target_compile_options(redis_metrics_test PRIVATE -Wall -Wextra)
 endif()

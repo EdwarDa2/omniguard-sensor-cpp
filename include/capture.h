@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <vector>
 
  
 struct PacketInfo {
@@ -39,6 +40,7 @@ bool parse_ethernet_ipv4(const uint8_t* data, size_t caplen, uint32_t origlen,
 class NetworkCapture {
 public:
     using PacketHandler = std::function<void(const PacketInfo&)>;
+    using TickHandler = std::function<void()>;
 
     
     explicit NetworkCapture(std::string interface_name = "");
@@ -47,15 +49,17 @@ public:
     NetworkCapture& operator=(const NetworkCapture&) = delete;
 
     bool open();
-    void run(PacketHandler handler);   
+    void run(PacketHandler handler, TickHandler tick_handler = {});
     void stop();
     const std::string& interface_name() const { return iface_; }
+    bool is_local_ipv4(const std::string& address) const;
 
 private:
     static void trampoline(u_char* user, const struct pcap_pkthdr* h, const u_char* bytes);
     static std::string pick_interface(std::string& err);
 
     std::string iface_;
+    std::vector<std::string> local_ipv4_addresses_;
     pcap_t* handle_ = nullptr;
     PacketHandler handler_;
 };
