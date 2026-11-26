@@ -190,11 +190,8 @@ int main(int argc, char** argv) {
             else if (p.risk == "MEDIUM") ++medium;
             else ++low;
 
-            if (capture.is_local_ipv4(p.src_ip) || capture.is_local_ipv4(p.dst_ip)) {
-                const bool inbound = !capture.is_local_ipv4(p.src_ip) &&
-                                     capture.is_local_ipv4(p.dst_ip);
-                metrics.record(p.length, inbound);
-            }
+            const bool inbound = !capture.is_local_ipv4(p.src_ip);
+            metrics.record(p.length, inbound);
 
             if (!publisher.publish(p)) {
                 if (++failed == 1 || failed % 100 == 0)

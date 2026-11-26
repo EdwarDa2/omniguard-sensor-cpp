@@ -88,6 +88,7 @@ std::string RedisPublisher::to_json(const PacketInfo& p) {
 }
 
 bool RedisPublisher::publish(const PacketInfo& pkt) {
+    std::lock_guard<std::mutex> lock(mutex_);
     const std::string json = to_json(pkt);
     for (int attempt = 0; attempt < 2; ++attempt) {
         if (!ctx_) {
@@ -109,6 +110,7 @@ bool RedisPublisher::publish(const PacketInfo& pkt) {
 }
 
 bool RedisPublisher::publish_metrics(const TrafficMetricsSnapshot& metrics, const std::string& sensor_status) {
+    std::lock_guard<std::mutex> lock(mutex_);
     std::ostringstream json;
     json << std::fixed << std::setprecision(6)
          << "{\"packets_per_sec\":" << metrics.packets_per_sec

@@ -224,14 +224,7 @@ bool NetworkCapture::open() {
     }
 
     const char* env = std::getenv("BPF_FILTER");
-    const std::string configured_filter = (env && *env) ? env : "ip";
-    std::string host_filter = "(";
-    for (size_t i = 0; i < local_ipv4_addresses_.size(); ++i) {
-        if (i > 0) host_filter += " or ";
-        host_filter += "host " + local_ipv4_addresses_[i];
-    }
-    host_filter += ")";
-    const std::string filter = "(" + configured_filter + ") and " + host_filter;
+    const std::string filter = (env && *env) ? env : "ip";
     bpf_program fp;
     if (pcap_compile(handle_, &fp, filter.c_str(), 1, PCAP_NETMASK_UNKNOWN) == -1) {
         std::cerr << "[SENSOR] Filtro BPF inválido '" << filter << "': " << pcap_geterr(handle_) << "\n";

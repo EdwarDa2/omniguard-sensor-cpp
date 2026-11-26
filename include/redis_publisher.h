@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <deque>
+#include <mutex>
 #include <string>
 
 #include "capture.h"
@@ -37,6 +38,7 @@ private:
     int port_;
     std::string channel_;
     redisContext* ctx_ = nullptr;
+    std::mutex mutex_{};
     std::chrono::steady_clock::time_point last_attempt_{};
     std::deque<HistoryPoint> history_{};
 };

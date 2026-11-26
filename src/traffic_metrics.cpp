@@ -22,11 +22,18 @@ TrafficMetricsSnapshot TrafficMetricsWindow::snapshot(double elapsed_seconds) co
     const uint64_t in = inbound_packets_.load(std::memory_order_relaxed);
     const uint64_t out = outbound_packets_.load(std::memory_order_relaxed);
 
+    uint64_t pps = static_cast<uint64_t>(std::llround(p / elapsed_seconds));
+    if (pps == 0 && p > 0) pps = 1;
+    uint64_t in_rate = static_cast<uint64_t>(std::llround(in / elapsed_seconds));
+    if (in_rate == 0 && in > 0) in_rate = 1;
+    uint64_t out_rate = static_cast<uint64_t>(std::llround(out / elapsed_seconds));
+    if (out_rate == 0 && out > 0) out_rate = 1;
+
     return {
-        static_cast<uint64_t>(std::llround(p / elapsed_seconds)),
+        pps,
         (static_cast<double>(b) * 8.0) / (elapsed_seconds * 1024.0 * 1024.0),
-        static_cast<uint64_t>(std::llround(in / elapsed_seconds)),
-        static_cast<uint64_t>(std::llround(out / elapsed_seconds)),
+        in_rate,
+        out_rate,
     };
 }
 
