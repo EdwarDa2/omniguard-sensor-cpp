@@ -1,0 +1,19 @@
+CXX = g++
+CXXFLAGS = -std=c++17 -Wall -Wextra -O2 -Iinclude -Isdk/npcap/Include
+LDFLAGS = -Lsdk/npcap/Lib/x64 -lwpcap -lws2_32 -lwinhttp
+
+SRCS = src/main.cpp src/capture.cpp src/classifier.cpp src/traffic_metrics.cpp src/http_publisher.cpp
+OBJS = $(SRCS:.cpp=.o)
+TARGET = omniguard-sensor.exe
+
+all: $(TARGET)
+
+$(TARGET): $(OBJS)
+	$(CXX) $(OBJS) $(LDFLAGS) -o $@
+	@echo [OK] Compilacion exitosa: $(TARGET)
+
+%.o: %.cpp
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+clean:
+	del /Q src\*.o $(TARGET)

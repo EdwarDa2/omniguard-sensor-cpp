@@ -6,8 +6,13 @@
 #include <iostream>
 #include <string>
 #include <thread>
+#include <vector>
 
 #ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 #include <io.h>
 #define OMNIGUARD_ISATTY _isatty
 #define OMNIGUARD_STDOUT_FILENO _fileno(stdout)
@@ -17,10 +22,13 @@
 #define OMNIGUARD_STDOUT_FILENO STDOUT_FILENO
 #endif
 
-#include <hiredis/hiredis.h>
-
 #include "capture.h"
+#include "http_publisher.h"
+
+#ifndef _WIN32
+#include <hiredis/hiredis.h>
 #include "redis_publisher.h"
+#endif
 
 namespace {
 
@@ -32,6 +40,17 @@ void on_signal(int) {
     g_running.store(false);
     if (g_capture) g_capture->stop();
 }
+
+#ifdef _WIN32
+BOOL WINAPI console_ctrl_handler(DWORD ctrl_type) {
+    if (ctrl_type == CTRL_C_EVENT || ctrl_type == CTRL_BREAK_EVENT || ctrl_type == CTRL_CLOSE_EVENT) {
+        g_running.store(false);
+        if (g_capture) g_capture->stop();
+        return TRUE;
+    }
+    return FALSE;
+}
+#endif
 
 std::string env_or(const char* name, const std::string& def) {
     const char* v = std::getenv(name);
@@ -57,89 +76,45 @@ void print_packet(unsigned long long n, const PacketInfo& p, bool color) {
     std::fflush(stdout);
 }
 
-void check_initial_state(const std::string& host, int port) {
-    timeval tv{1, 500000};
-    redisContext* ctx = redisConnectWithTimeout(host.c_str(), port, tv);
-    if (!ctx || ctx->err) {
-        if (ctx) redisFree(ctx);
-        return;
-    }
-    auto* reply = static_cast<redisReply*>(redisCommand(ctx, "GET sensor:desired_state"));
-    if (reply) {
-        if (reply->type == REDIS_REPLY_STRING && reply->str) {
-            std::string state(reply->str);
-            if (state == "PAUSED" || state == "STOP") {
-                g_paused.store(true);
-                std::cout << "[SENSOR] Estado inicial configurado en Redis: PAUSED" << std::endl;
-            }
-        }
-        freeReplyObject(reply);
-    }
-    redisFree(ctx);
-}
-
 }   // namespace
 
 int main(int argc, char** argv) {
-    const std::string iface = (argc > 1) ? argv[1] : env_or("INTERFACE", "");
-    const std::string host = env_or("REDIS_HOST", "127.0.0.1");
-    const int port = std::atoi(env_or("REDIS_PORT", "6379").c_str());
-    const std::string cmd_channel = env_or("SENSOR_COMMANDS_CHANNEL", "sensor_commands_channel");
+    std::string iface = "";
+    std::string ingest_url = env_or("INGEST_URL", "");
+    std::string token = env_or("INTERNAL_API_TOKEN", "omniguard_m2m_secret_token_dev_2026");
 
-    RedisPublisher publisher(host, port);
-    if (!publisher.connect()) return 1;
+#ifdef _WIN32
+    SetConsoleCtrlHandler(console_ctrl_handler, TRUE);
+    if (ingest_url.empty()) {
+        ingest_url = "http://localhost:8080/api/v1/internal/telemetry";
+    }
+#endif
 
-    // Verificar si el estado guardado en Redis es PAUSED
-    check_initial_state(host, port);
-
-    // Hilo dedicado para escuchar comandos de control remoto desde Redis
-    std::thread cmd_thread([host, port, cmd_channel]() {
-        while (g_running.load()) {
-            timeval tv{2, 0};
-            redisContext* ctx = redisConnectWithTimeout(host.c_str(), port, tv);
-            if (!ctx || ctx->err) {
-                if (ctx) redisFree(ctx);
-                std::this_thread::sleep_for(std::chrono::seconds(2));
-                continue;
-            }
-
-            auto* reply = static_cast<redisReply*>(redisCommand(ctx, "SUBSCRIBE %s", cmd_channel.c_str()));
-            if (reply) freeReplyObject(reply);
-            std::cout << "[SENSOR] Escuchando comandos en canal Redis '" << cmd_channel << "'" << std::endl;
-
-            while (g_running.load()) {
-                void* r = nullptr;
-                if (redisGetReply(ctx, &r) == REDIS_OK && r) {
-                    auto* rep = static_cast<redisReply*>(r);
-                    if (rep->type == REDIS_REPLY_ARRAY && rep->elements == 3) {
-                        const std::string msg_type = (rep->element[0] && rep->element[0]->str) ? rep->element[0]->str : "";
-                        if (msg_type == "message" && rep->element[2] && rep->element[2]->str) {
-                            const std::string payload = rep->element[2]->str;
-                            if (payload.find("PAUSE") != std::string::npos || payload.find("STOP") != std::string::npos) {
-                                g_paused.store(true);
-                                std::cout << "\n[SENSOR] >>> Comando recibido: PAUSA. Captura de paquetes suspendida." << std::endl;
-                            } else if (payload.find("RESUME") != std::string::npos || payload.find("START") != std::string::npos) {
-                                g_paused.store(false);
-                                std::cout << "\n[SENSOR] >>> Comando recibido: ACTIVAR. Captura de paquetes reanudada." << std::endl;
-                            }
-                        }
-                    }
-                    freeReplyObject(rep);
-                } else {
-                    break;
-                }
-            }
-            if (ctx) redisFree(ctx);
-            if (g_running.load()) {
-                std::this_thread::sleep_for(std::chrono::seconds(2));
-            }
+    // Procesar argumentos de línea de comandos
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--url" && i + 1 < argc) {
+            ingest_url = argv[++i];
+        } else if (arg == "--token" && i + 1 < argc) {
+            token = argv[++i];
+        } else if (iface.empty() && arg.rfind("--", 0) != 0) {
+            iface = arg;
         }
-    });
+    }
+
+    std::cout << "========================================================\n"
+              << "       OmniGuard SOC Network Sensor (Windows/Linux)      \n"
+              << "========================================================\n"
+              << "[SENSOR] Modo: Enlace Seguro HTTP/HTTPS\n"
+              << "[SENSOR] Servidor Cloud: " << ingest_url << "\n"
+              << "[SENSOR] Token M2M: " << (token.empty() ? "(ninguno)" : "(configurado)") << "\n"
+              << "--------------------------------------------------------\n";
+
+    HttpPublisher publisher(ingest_url, token);
 
     NetworkCapture capture(iface);
     if (!capture.open()) {
-        g_running.store(false);
-        if (cmd_thread.joinable()) cmd_thread.detach();
+        std::cerr << "[SENSOR] Error al iniciar la captura de red.\n";
         return 1;
     }
     g_capture = &capture;
@@ -147,15 +122,15 @@ int main(int argc, char** argv) {
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
 
-    std::cout << "[SENSOR] Interfaz activa: " << capture.interface_name() << std::endl
-              << "[SENSOR] Capturando en canal '" << publisher.channel() << "'" << std::endl
-              << "[SENSOR] Presiona Ctrl+C para detener." << std::endl << std::endl;
+    std::cout << "[SENSOR] Interfaz activa: " << capture.interface_name() << "\n"
+              << "[SENSOR] Capturando tráfico y transmitiendo a la nube...\n"
+              << "[SENSOR] Presiona Ctrl+C para detener.\n\n";
 
     const bool color = OMNIGUARD_ISATTY(OMNIGUARD_STDOUT_FILENO) != 0;
     unsigned long long total = 0, low = 0, medium = 0, high = 0, failed = 0;
     TrafficMetricsWindow metrics;
 
-    // Hilo dedicado de telemetría: publica métricas e historial a Redis cada 5s
+    // Hilo dedicado de telemetría: publica métricas e historial al backend cada 5s
     std::thread ticker_thread([&publisher, &metrics, &failed]() {
         auto window_started = std::chrono::steady_clock::now();
         while (g_running.load()) {
@@ -171,19 +146,17 @@ int main(int argc, char** argv) {
             TrafficMetricsSnapshot snap = is_paused ? TrafficMetricsSnapshot{0, 0.0, 0, 0} : metrics.snapshot(elapsed);
 
             if (!publisher.publish_metrics(snap, status)) {
-                if (++failed == 1 || failed % 100 == 0)
-                    std::fprintf(stderr, "[REDIS] No se pudo publicar telemetría (fallos acumulados: %llu)\n", failed);
+                if (++failed == 1 || failed % 20 == 0)
+                    std::fprintf(stderr, "[TELEMETRÍA] Advertencia: No se pudo enviar métricas (intentos fallidos: %llu)\n", failed);
             }
             metrics.reset();
         }
     });
 
+    // Bucle principal de captura de paquetes
     capture.run(
         [&](const PacketInfo& p) {
-            // Si el sensor está pausado por el Frontend, descartar procesamiento
-            if (g_paused.load()) {
-                return;
-            }
+            if (g_paused.load()) return;
 
             ++total;
             if (p.risk == "HIGH") ++high;
@@ -194,17 +167,19 @@ int main(int argc, char** argv) {
             metrics.record(p.length, inbound);
 
             if (!publisher.publish(p)) {
-                if (++failed == 1 || failed % 100 == 0)
-                    std::fprintf(stderr, "[REDIS] No se pudo publicar (fallos acumulados: %llu)\n", failed);
+                if (++failed == 1 || failed % 50 == 0)
+                    std::fprintf(stderr, "[TELEMETRÍA] Advertencia: No se pudo enviar evento a la nube (fallos: %llu)\n", failed);
             }
             print_packet(total, p, color);
         });
 
     g_running.store(false);
-    if (cmd_thread.joinable()) cmd_thread.detach();
-    if (ticker_thread.joinable()) ticker_thread.detach();
+    publisher.flush();
+    if (ticker_thread.joinable()) ticker_thread.join();
 
-    std::printf("\n[SENSOR] Detenido. Paquetes: %llu | LOW: %llu | MEDIUM: %llu | HIGH: %llu | fallos Redis: %llu\n",
+    std::printf("\n========================================================\n"
+                "[SENSOR] Detenido. Paquetes: %llu | LOW: %llu | MEDIUM: %llu | HIGH: %llu | Fallos de red: %llu\n"
+                "========================================================\n",
                 total, low, medium, high, failed);
     return 0;
 }

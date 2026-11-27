@@ -1,8 +1,16 @@
 #include "capture.h"
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#endif
 
 #include <cstdlib>
 #include <cstring>
@@ -60,7 +68,7 @@ std::string ip_to_string(const uint8_t* b) {
 
 uint16_t be16(const uint8_t* p) { return static_cast<uint16_t>((p[0] << 8) | p[1]); }
 
-bool find_ipv4_addresses(const std::string& interface_name, std::vector<std::string>& addresses,
+bool find_ipv4_addresses(std::string& interface_name, std::vector<std::string>& addresses,
                          std::string& err) {
     pcap_if_t* devices = nullptr;
     char errbuf[PCAP_ERRBUF_SIZE] = {0};
@@ -69,22 +77,31 @@ bool find_ipv4_addresses(const std::string& interface_name, std::vector<std::str
         return false;
     }
 
-    for (pcap_if_t* device = devices; device; device = device->next) {
-        if (interface_name != device->name) continue;
-        for (pcap_addr_t* address = device->addresses; address; address = address->next) {
-            if (!address->addr || address->addr->sa_family != AF_INET) continue;
-            const auto* ipv4 = reinterpret_cast<const sockaddr_in*>(address->addr);
-            char text[INET_ADDRSTRLEN] = {0};
-            if (inet_ntop(AF_INET, &ipv4->sin_addr, text, sizeof(text))) {
-                addresses.emplace_back(text);
+    pcap_if_t* matched_dev = nullptr;
+    int idx = 1;
+    for (pcap_if_t* device = devices; device; device = device->next, ++idx) {
+        bool match = (interface_name == device->name);
+        if (!match && interface_name == std::to_string(idx)) match = true;
+        if (!match && device->description && std::string(device->description).find(interface_name) != std::string::npos) match = true;
+
+        if (match) {
+            matched_dev = device;
+            interface_name = device->name; // Usar el nombre de dispositivo real para pcap_open_live
+            for (pcap_addr_t* address = device->addresses; address; address = address->next) {
+                if (!address->addr || address->addr->sa_family != AF_INET) continue;
+                const auto* ipv4 = reinterpret_cast<const sockaddr_in*>(address->addr);
+                char text[INET_ADDRSTRLEN] = {0};
+                if (inet_ntop(AF_INET, &ipv4->sin_addr, text, sizeof(text))) {
+                    addresses.emplace_back(text);
+                }
             }
+            break;
         }
-        break;
     }
 
     pcap_freealldevs(devices);
-    if (addresses.empty()) {
-        err = "No se encontró una dirección IPv4 propia en la interfaz '" + interface_name + "'";
+    if (!matched_dev) {
+        err = "No se encontró el dispositivo de red '" + interface_name + "'";
         return false;
     }
     return true;
@@ -165,6 +182,9 @@ NetworkCapture::NetworkCapture(std::string interface_name) : iface_(std::move(in
 
 NetworkCapture::~NetworkCapture() {
     if (handle_) pcap_close(handle_);
+#ifdef _WIN32
+    WSACleanup();
+#endif
 }
 
 std::string NetworkCapture::pick_interface(std::string& err) {
@@ -175,17 +195,30 @@ std::string NetworkCapture::pick_interface(std::string& err) {
         return "";
     }
     std::string chosen;
-    for (pcap_if_t* d = devs; d; d = d->next) {
-        if (!(d->flags & PCAP_IF_UP) || !(d->flags & PCAP_IF_RUNNING)) continue;
+    std::cout << "[SENSOR] Interfaces de red disponibles:" << std::endl;
+    int idx = 1;
+    for (pcap_if_t* d = devs; d; d = d->next, ++idx) {
         if (d->flags & PCAP_IF_LOOPBACK) continue;
         if (std::strcmp(d->name, "any") == 0) continue;
+        std::string ip_found = "";
         for (pcap_addr_t* a = d->addresses; a; a = a->next) {
             if (a->addr && a->addr->sa_family == AF_INET) {
-                chosen = d->name;
-                break;
+                const auto* ipv4 = reinterpret_cast<const sockaddr_in*>(a->addr);
+                char text[INET_ADDRSTRLEN] = {0};
+                if (inet_ntop(AF_INET, &ipv4->sin_addr, text, sizeof(text))) {
+                    ip_found = text;
+                    break;
+                }
             }
         }
-        if (!chosen.empty()) break;
+        std::string desc = d->description ? d->description : d->name;
+        std::cout << "  [" << idx << "] " << desc;
+        if (!ip_found.empty()) std::cout << " (IPv4: " << ip_found << ")";
+        std::cout << std::endl;
+
+        if (chosen.empty() && !ip_found.empty()) {
+            chosen = d->name;
+        }
     }
     pcap_freealldevs(devs);
     if (chosen.empty())
@@ -195,6 +228,11 @@ std::string NetworkCapture::pick_interface(std::string& err) {
 
 bool NetworkCapture::open() {
     std::string err;
+#ifdef _WIN32
+    WSADATA wsaData;
+    WSAStartup(MAKEWORD(2, 2), &wsaData);
+#endif
+
     if (iface_.empty()) {
         iface_ = pick_interface(err);
         if (iface_.empty()) {
