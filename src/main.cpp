@@ -13,7 +13,11 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <iphlpapi.h>
 #include <io.h>
+#include <set>
 #define OMNIGUARD_ISATTY _isatty
 #define OMNIGUARD_STDOUT_FILENO _fileno(stdout)
 #else
@@ -52,6 +56,33 @@ BOOL WINAPI console_ctrl_handler(DWORD ctrl_type) {
 }
 #endif
 
+int audit_local_listening_ports() {
+#ifdef _WIN32
+    DWORD dwSize = 0;
+    GetExtendedTcpTable(nullptr, &dwSize, TRUE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
+    if (dwSize == 0) return 0;
+
+    std::vector<BYTE> buffer(dwSize);
+    auto pTable = reinterpret_cast<PMIB_TCPTABLE_OWNER_PID>(buffer.data());
+
+    if (GetExtendedTcpTable(pTable, &dwSize, TRUE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0) == NO_ERROR) {
+        std::set<uint16_t> distinct_listening_ports;
+        for (DWORD i = 0; i < pTable->dwNumEntries; ++i) {
+            if (pTable->table[i].dwState == MIB_TCP_STATE_LISTEN) {
+                uint16_t port = ntohs(static_cast<u_short>(pTable->table[i].dwLocalPort));
+                if (port > 0) {
+                    distinct_listening_ports.insert(port);
+                }
+            }
+        }
+        return static_cast<int>(distinct_listening_ports.size());
+    }
+    return 0;
+#else
+    return 0;
+#endif
+}
+
 std::string env_or(const char* name, const std::string& def) {
     const char* v = std::getenv(name);
     return (v && *v) ? v : def;
@@ -80,13 +111,14 @@ void print_packet(unsigned long long n, const PacketInfo& p, bool color) {
 
 int main(int argc, char** argv) {
     std::string iface = "";
-    std::string ingest_url = env_or("INGEST_URL", "");
-    std::string token = env_or("INTERNAL_API_TOKEN", "omniguard_m2m_secret_token_dev_2026");
+    std::string ingest_url = env_or("INGEST_URL", "http://165.227.121.157/api/v1/internal/telemetry");
+    std::string token = env_or("INTERNAL_API_TOKEN", "omniguard_m2m_secret_token_2026_soc_prod");
+    std::string sensor_id = env_or("SENSOR_ID", "");
 
 #ifdef _WIN32
     SetConsoleCtrlHandler(console_ctrl_handler, TRUE);
     if (ingest_url.empty()) {
-        ingest_url = "http://localhost:8080/api/v1/internal/telemetry";
+        ingest_url = "http://165.227.121.157/api/v1/internal/telemetry";
     }
 #endif
 
@@ -97,9 +129,16 @@ int main(int argc, char** argv) {
             ingest_url = argv[++i];
         } else if (arg == "--token" && i + 1 < argc) {
             token = argv[++i];
+        } else if (arg == "--sensor-id" && i + 1 < argc) {
+            sensor_id = argv[++i];
         } else if (iface.empty() && arg.rfind("--", 0) != 0) {
             iface = arg;
         }
+    }
+
+    if (sensor_id.empty()) {
+        const char* comp = std::getenv("COMPUTERNAME");
+        sensor_id = (comp && *comp) ? comp : "default-host";
     }
 
     std::cout << "========================================================\n"
@@ -107,10 +146,11 @@ int main(int argc, char** argv) {
               << "========================================================\n"
               << "[SENSOR] Modo: Enlace Seguro HTTP/HTTPS\n"
               << "[SENSOR] Servidor Cloud: " << ingest_url << "\n"
+              << "[SENSOR] Identificador de Host (Sensor ID): " << sensor_id << "\n"
               << "[SENSOR] Token M2M: " << (token.empty() ? "(ninguno)" : "(configurado)") << "\n"
               << "--------------------------------------------------------\n";
 
-    HttpPublisher publisher(ingest_url, token);
+    HttpPublisher publisher(ingest_url, token, sensor_id);
 
     NetworkCapture capture(iface);
     if (!capture.open()) {
@@ -122,7 +162,9 @@ int main(int argc, char** argv) {
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
 
-    std::cout << "[SENSOR] Interfaz activa: " << capture.interface_name() << "\n"
+    const int initial_open_ports = audit_local_listening_ports();
+    std::cout << "[AUDITORÍA] Puertos locales activos en escucha (LISTENING): " << initial_open_ports << "\n"
+              << "[SENSOR] Interfaz activa: " << capture.interface_name() << "\n"
               << "[SENSOR] Capturando tráfico y transmitiendo a la nube...\n"
               << "[SENSOR] Presiona Ctrl+C para detener.\n\n";
 
@@ -132,6 +174,19 @@ int main(int argc, char** argv) {
 
     // Hilo dedicado de telemetría: publica métricas e historial al backend cada 5s
     std::thread ticker_thread([&publisher, &metrics, &failed]() {
+        // Burst inicial t=0s para sincronización instantánea con el SOC Dashboard
+        {
+            TrafficMetricsSnapshot initial_snap{0, 0.0, 0, 0};
+            const int open_ports = audit_local_listening_ports();
+            if (!publisher.publish_metrics(initial_snap, "ACTIVE", open_ports)) {
+                if (++failed == 1)
+                    std::fprintf(stderr, "[TELEMETRÍA] Advertencia: Fallo en burst inicial t=0s\n");
+            } else {
+                std::printf("[TELEMETRÍA] Burst inicial t=0s enviado exitosamente. Puertos abiertos detectados: %d\n", open_ports);
+                std::fflush(stdout);
+            }
+        }
+
         auto window_started = std::chrono::steady_clock::now();
         while (g_running.load()) {
             std::this_thread::sleep_for(std::chrono::seconds(5));
@@ -144,8 +199,9 @@ int main(int argc, char** argv) {
             const bool is_paused = g_paused.load();
             const std::string status = is_paused ? "PAUSED" : "ACTIVE";
             TrafficMetricsSnapshot snap = is_paused ? TrafficMetricsSnapshot{0, 0.0, 0, 0} : metrics.snapshot(elapsed);
+            const int open_ports = audit_local_listening_ports();
 
-            if (!publisher.publish_metrics(snap, status)) {
+            if (!publisher.publish_metrics(snap, status, open_ports)) {
                 if (++failed == 1 || failed % 20 == 0)
                     std::fprintf(stderr, "[TELEMETRÍA] Advertencia: No se pudo enviar métricas (intentos fallidos: %llu)\n", failed);
             }

@@ -6,12 +6,15 @@
 #endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <iphlpapi.h>
 #else
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #endif
 
+#include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -187,6 +190,42 @@ NetworkCapture::~NetworkCapture() {
 #endif
 }
 
+#ifdef _WIN32
+static std::string get_best_adapter_guid_for_cloud(const std::string& target_ip_str) {
+    DWORD dest_ip = inet_addr(target_ip_str.c_str());
+    if (dest_ip == INADDR_NONE || dest_ip == INADDR_ANY) {
+        dest_ip = inet_addr("165.227.121.157");
+    }
+    DWORD best_if_index = 0;
+    if (GetBestInterface(dest_ip, &best_if_index) != NO_ERROR) {
+        return "";
+    }
+
+    ULONG out_buf_len = 15000;
+    std::vector<BYTE> buf(out_buf_len);
+    PIP_ADAPTER_ADDRESSES pAddresses = reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buf.data());
+
+    ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+    DWORD ret = GetAdaptersAddresses(AF_INET, flags, nullptr, pAddresses, &out_buf_len);
+    if (ret == ERROR_BUFFER_OVERFLOW) {
+        buf.resize(out_buf_len);
+        pAddresses = reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buf.data());
+        ret = GetAdaptersAddresses(AF_INET, flags, nullptr, pAddresses, &out_buf_len);
+    }
+
+    if (ret == NO_ERROR) {
+        for (PIP_ADAPTER_ADDRESSES pCurr = pAddresses; pCurr; pCurr = pCurr->Next) {
+            if (pCurr->IfIndex == best_if_index || pCurr->Ipv6IfIndex == best_if_index) {
+                if (pCurr->AdapterName) {
+                    return std::string(pCurr->AdapterName);
+                }
+            }
+        }
+    }
+    return "";
+}
+#endif
+
 std::string NetworkCapture::pick_interface(std::string& err) {
     pcap_if_t* devs = nullptr;
     char errbuf[PCAP_ERRBUF_SIZE] = {0};
@@ -194,12 +233,22 @@ std::string NetworkCapture::pick_interface(std::string& err) {
         err = errbuf;
         return "";
     }
+
+#ifdef _WIN32
+    std::string best_guid = get_best_adapter_guid_for_cloud("165.227.121.157");
+#endif
+
     std::string chosen;
+    std::string chosen_desc;
+    std::string chosen_ip;
+    int highest_score = -999999;
+
     std::cout << "[SENSOR] Interfaces de red disponibles:" << std::endl;
     int idx = 1;
     for (pcap_if_t* d = devs; d; d = d->next, ++idx) {
         if (d->flags & PCAP_IF_LOOPBACK) continue;
         if (std::strcmp(d->name, "any") == 0) continue;
+
         std::string ip_found = "";
         for (pcap_addr_t* a = d->addresses; a; a = a->next) {
             if (a->addr && a->addr->sa_family == AF_INET) {
@@ -211,18 +260,71 @@ std::string NetworkCapture::pick_interface(std::string& err) {
                 }
             }
         }
+
         std::string desc = d->description ? d->description : d->name;
+        int score = 0;
+
+        if (ip_found.empty()) {
+            score = -1000;
+        } else {
+            if (ip_found.rfind("169.254.", 0) == 0) {
+                score -= 500; // APIPA (sin conexión real)
+            } else if (ip_found.rfind("127.", 0) == 0) {
+                score -= 500; // Loopback
+            } else {
+                score += 50;  // IPv4 válida
+            }
+        }
+
+        std::string lower_desc;
+        for (char c : desc) lower_desc += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+        if (lower_desc.find("bluetooth") != std::string::npos) score -= 300;
+        if (lower_desc.find("virtualbox") != std::string::npos) score -= 200;
+        if (lower_desc.find("vmware") != std::string::npos) score -= 200;
+        if (lower_desc.find("vethernet") != std::string::npos) score -= 150;
+        if (lower_desc.find("hyper-v") != std::string::npos) score -= 150;
+        if (lower_desc.find("host-only") != std::string::npos) score -= 200;
+        if (lower_desc.find("wan miniport") != std::string::npos) score -= 400;
+
+        if (lower_desc.find("wireless") != std::string::npos || lower_desc.find("wi-fi") != std::string::npos || lower_desc.find("802.11") != std::string::npos) {
+            score += 100;
+        }
+        if (lower_desc.find("ethernet") != std::string::npos || lower_desc.find("gigabit") != std::string::npos) {
+            score += 80;
+        }
+
+#ifdef _WIN32
+        bool is_best_route = false;
+        if (!best_guid.empty() && std::string(d->name).find(best_guid) != std::string::npos) {
+            score += 2000;
+            is_best_route = true;
+        }
+#endif
+
         std::cout << "  [" << idx << "] " << desc;
         if (!ip_found.empty()) std::cout << " (IPv4: " << ip_found << ")";
+#ifdef _WIN32
+        if (is_best_route) std::cout << " [RUTA PRINCIPAL A INTERNET]";
+#endif
         std::cout << std::endl;
 
-        if (chosen.empty() && !ip_found.empty()) {
+        if (score > highest_score && !ip_found.empty()) {
+            highest_score = score;
             chosen = d->name;
+            chosen_desc = desc;
+            chosen_ip = ip_found;
         }
     }
     pcap_freealldevs(devs);
-    if (chosen.empty())
-        err = "No se encontró una interfaz activa con IPv4. Indica una: ./omniguard-sensor <interfaz>";
+
+    if (chosen.empty() || highest_score < -200) {
+        err = "No se encontró una interfaz activa con acceso a red. Verifica tu conexión Wi-Fi o Ethernet.";
+        return "";
+    }
+
+    std::cout << "[SENSOR] Interfaz activa seleccionada automáticamente: "
+              << chosen_desc << " (" << chosen_ip << ")" << std::endl;
     return chosen;
 }
 

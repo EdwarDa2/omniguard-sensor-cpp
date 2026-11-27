@@ -17,7 +17,7 @@ struct HttpHistoryPoint {
 
 class HttpPublisher {
 public:
-    HttpPublisher(std::string base_url, std::string auth_token);
+    HttpPublisher(std::string base_url, std::string auth_token, std::string sensor_id = "");
     ~HttpPublisher();
 
     HttpPublisher(const HttpPublisher&) = delete;
@@ -25,7 +25,7 @@ public:
 
     bool publish(const PacketInfo& pkt);
     bool flush();
-    bool publish_metrics(const TrafficMetricsSnapshot& metrics, const std::string& sensor_status = "ACTIVE");
+    bool publish_metrics(const TrafficMetricsSnapshot& metrics, const std::string& sensor_status = "ACTIVE", int open_ports = 0);
 
     static std::string to_json(const PacketInfo& pkt);
 
@@ -37,6 +37,7 @@ private:
 
     std::string base_url_;
     std::string auth_token_;
+    std::string sensor_id_;
     std::mutex mutex_{};
     std::deque<HttpHistoryPoint> history_{};
     std::vector<PacketInfo> batch_buffer_{};

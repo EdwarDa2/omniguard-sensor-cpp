@@ -80,11 +80,16 @@ bool parse_url(const std::string& url, bool& is_https, std::wstring& host_out,
 
 }  // namespace
 
-HttpPublisher::HttpPublisher(std::string base_url, std::string auth_token)
+HttpPublisher::HttpPublisher(std::string base_url, std::string auth_token, std::string sensor_id)
     : base_url_(std::move(base_url)),
       auth_token_(std::move(auth_token)),
+      sensor_id_(std::move(sensor_id)),
       last_flush_(std::chrono::steady_clock::now()) {
-    std::cout << "[HTTP-PUBLISHER] Configurado hacia: " << base_url_ << std::endl;
+    if (sensor_id_.empty()) {
+        const char* comp = std::getenv("COMPUTERNAME");
+        sensor_id_ = (comp && *comp) ? comp : "default-host";
+    }
+    std::cout << "[HTTP-PUBLISHER] Configurado hacia: " << base_url_ << " (Sensor ID: " << sensor_id_ << ")" << std::endl;
 }
 
 HttpPublisher::~HttpPublisher() {
@@ -145,7 +150,7 @@ bool HttpPublisher::flush() {
     return send_post("/events", batch_json.str());
 }
 
-bool HttpPublisher::publish_metrics(const TrafficMetricsSnapshot& metrics, const std::string& sensor_status) {
+bool HttpPublisher::publish_metrics(const TrafficMetricsSnapshot& metrics, const std::string& sensor_status, int open_ports) {
     std::lock_guard<std::mutex> lock(mutex_);
     std::ostringstream json;
     json << std::fixed << std::setprecision(6)
@@ -154,6 +159,8 @@ bool HttpPublisher::publish_metrics(const TrafficMetricsSnapshot& metrics, const
          << ",\"sensor_status\":\"" << json_escape(sensor_status) << "\""
          << ",\"inbound\":" << metrics.inbound
          << ",\"outbound\":" << metrics.outbound
+         << ",\"open_ports\":" << open_ports
+         << ",\"sensor_id\":\"" << json_escape(sensor_id_) << "\""
          << "}";
     const std::string payload = json.str();
 
